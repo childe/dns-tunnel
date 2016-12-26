@@ -22,6 +22,7 @@ var options = &struct {
 	port      int
 	dnsServer string
 	domain    string
+	timeout   uint64
 }{}
 
 var dnsServerAddr *net.UDPAddr
@@ -31,6 +32,7 @@ func init() {
 	flag.IntVar(&options.port, "port", 8080, "port that bind to, default 8080")
 	flag.StringVar(&options.dnsServer, "dns", "", "dns server")
 	flag.StringVar(&options.domain, "domain", "", "domain required, like yourdomain.me")
+	flag.Uint64Var(&options.timeout, "timeout", 10000, "timeout(ms) read from dns server")
 	flag.Parse()
 
 	if options.domain == "" {
@@ -90,7 +92,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	rawRequest, err := getStreamFromRequest(r)
 	if err != nil {
 		log.Printf("failed to get raw string from request: %s\n", err)
-		w.Write([]byte("failed to get raw string from request\n"))
+		w.Write([]byte("failed to get raw string from request.\n"))
 		w.Write([]byte(err.Error()))
 		w.WriteHeader(500)
 		return
@@ -102,8 +104,8 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	conn, err := net.DialUDP("udp", nil, dnsServerAddr)
 	if err != nil {
-		log.Printf("could not connect to dns server: %s\n")
-		w.Write([]byte("could not connect to dns server"))
+		log.Printf("could not connect to dns server: %s\n", err)
+		w.Write([]byte("could not connect to dns server.\n"))
 		w.Write([]byte(err.Error()))
 		w.WriteHeader(500)
 		return
@@ -113,7 +115,15 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	conn.Write(buffer[:length])
 
+	conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(options.timeout)))
 	n, err := conn.Read(buffer)
+	if err != nil {
+		log.Printf("read dns response timeout: %s\n", err)
+		w.Write([]byte("read dns response timeout"))
+		w.Write([]byte(err.Error()))
+		w.WriteHeader(500)
+		return
+	}
 	log.Printf("read %d bytes\n", n)
 
 	w.WriteHeader(200)
