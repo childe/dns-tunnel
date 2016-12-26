@@ -14,7 +14,9 @@ import (
 	"time"
 )
 
-var MAX_SIZE = 65535
+var MAX_SIZE = 0xffffffff
+var BATCH_SIZE = 4096
+
 var OUTOFMAXSIZE = errors.New("OUTOFMAXSIZE")
 
 var options = &struct {
@@ -59,31 +61,27 @@ func init() {
 
 }
 
-func getStreamFromRequest(r *http.Request) (string, error) {
-	rst := ""
-	rst += fmt.Sprintf("%s %s %s\n", r.Method, r.URL.String(), r.Proto)
-	rst += fmt.Sprintf("Host: %s\n", r.Host)
+func getStreamFromRequest(r *http.Request) ([]byte, error) {
+	rst := make([]byte, 0)
+	//TODO
+	rst = append(rst, fmt.Sprintf("%s %s %s\n", r.Method, r.URL.String(), r.Proto)...)
+	rst = append(rst, fmt.Sprintf("Host: %s\n", r.Host)...)
 	for k, v := range r.Header {
-		rst += fmt.Sprintf("%s: %s\n", k, strings.Join(v, ","))
+		rst = append(rst, fmt.Sprintf("%s: %s\n", k, strings.Join(v, ","))...)
 	}
 
-	rst += "\n"
+	rst = append(rst, '\n')
 
-	p := make([]byte, MAX_SIZE)
-	size := 0
+	p := make([]byte, BATCH_SIZE)
 	for {
 		n, err := r.Body.Read(p)
 		if err != nil && err != io.EOF {
-			return "", err
+			return nil, err
 		}
-		rst += string(p[:n])
-		size += n
 		if err == io.EOF {
 			break
 		}
-	}
-	if size > MAX_SIZE {
-		return "", OUTOFMAXSIZE
+		rst = append(rst, p[:n]...)
 	}
 	return rst, nil
 }
@@ -97,10 +95,8 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)
 		return
 	}
-	log.Println(rawRequest)
-
-	buffer := make([]byte, MAX_SIZE)
-	length := fakeDNSRequestEncode(rawRequest, buffer)
+	log.Println(string(rawRequest))
+	log.Printf("rawRequest length: %d\n", len(rawRequest))
 
 	conn, err := net.DialUDP("udp", nil, dnsServerAddr)
 	if err != nil {
@@ -113,8 +109,18 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("connected to %s\n", dnsServerAddr)
 	defer conn.Close()
 
-	conn.Write(buffer[:length])
+	start := 0
+	for {
+		buffer := make([]byte, 24+BATCH_SIZE)
+		bufferLength, fragmentSize := fakeDNSRequestEncode(buffer, rawRequest, start)
+		log.Printf("fake dns request length: %d\n", bufferLength)
+		conn.Write(buffer[:bufferLength])
+		if start+fragmentSize >= len(rawRequest) {
+			break
+		}
+	}
 
+	buffer := make([]byte, MAX_SIZE)
 	conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(options.timeout)))
 	n, err := conn.Read(buffer)
 	if err != nil {
@@ -130,7 +136,9 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	return
 }
 
-func fakeDNSRequestEncode(content string, buffer []byte) int {
+func fakeDNSRequestEncode(buffer, content []byte, start int) (int, int) {
+	log.Printf("buffer size: %d\n", len(buffer))
+	log.Printf("start postion: %d\n", start)
 	now := time.Now().Unix()
 	domain := fmt.Sprintf("%d.%s", now, options.domain)
 	log.Printf("domain: %s\n", domain)
@@ -168,11 +176,34 @@ func fakeDNSRequestEncode(content string, buffer []byte) int {
 	binary.BigEndian.PutUint16(buffer[offset:], 1)
 	offset += 2
 
-	copy(buffer[offset:], []byte(content))
+	// fragment start position
+	binary.BigEndian.PutUint32(buffer[offset:], uint32(start))
+	offset += 4
 
-	offset += len(content)
+	// fragment length
+	contentSize := len(content)
+	fl := 0
+	if start+BATCH_SIZE >= contentSize {
+		fl = contentSize - start
+	} else {
+		fl = BATCH_SIZE
+	}
+	binary.BigEndian.PutUint32(buffer[offset:], uint32(fl))
+	offset += 4
 
-	return offset
+	// totol size
+	binary.BigEndian.PutUint32(buffer[offset:], uint32(contentSize))
+	offset += 4
+
+	log.Println(offset)
+	log.Println(fl)
+	log.Println(len(content))
+
+	copy(buffer[offset:], content[:fl])
+	offset += fl
+	log.Println(offset)
+
+	return offset, fl
 }
 
 func main() {
