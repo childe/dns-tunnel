@@ -14,7 +14,6 @@ import (
 	"time"
 )
 
-var MAX_SIZE = 0xffffffff
 var BATCH_SIZE = 500
 
 var OUTOFMAXSIZE = errors.New("OUTOFMAXSIZE")
