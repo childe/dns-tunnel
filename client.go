@@ -122,26 +122,36 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	buffer := make([]byte, MAX_SIZE)
-	conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(options.timeout)))
-	n, err := conn.Read(buffer)
-	if err != nil {
-		log.Printf("read dns response timeout: %s\n", err)
-		w.Write([]byte("read dns response timeout"))
-		w.Write([]byte(err.Error()))
-		w.WriteHeader(500)
-		return
+	response := make([]byte, BATCH_SIZE)
+	responseSize := 0
+	buffer := make([]byte, 1024)
+	for {
+		conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(options.timeout)))
+		n, err := conn.Read(buffer)
+		if err != nil && err != io.EOF {
+			log.Printf("read dns response error: %s\n", err)
+			w.Write([]byte("read dns response error"))
+			w.Write([]byte(err.Error()))
+			w.WriteHeader(500)
+			return
+		}
+		log.Printf("read %d bytes\n", n)
+		response = append(response, buffer[:n]...)
+		responseSize += n
+		if err == io.EOF {
+			break
+		}
 	}
-	log.Printf("read %d bytes\n", n)
-
+	w.Write(response[:responseSize])
 	w.WriteHeader(200)
 	return
 }
 
+// the totalSize|startPositon|FragmentSize Protocol
 func fakeDNSRequestEncode(buffer, content []byte, start int) (int, int) {
 	log.Printf("buffer size: %d\n", len(buffer))
 	log.Printf("start postion: %d\n", start)
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 	domain := fmt.Sprintf("%d.%s", now, options.domain)
 	log.Printf("domain: %s\n", domain)
 
