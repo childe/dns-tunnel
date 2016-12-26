@@ -15,7 +15,7 @@ import (
 )
 
 var MAX_SIZE = 0xffffffff
-var BATCH_SIZE = 4096
+var BATCH_SIZE = 500
 
 var OUTOFMAXSIZE = errors.New("OUTOFMAXSIZE")
 
@@ -72,16 +72,16 @@ func getStreamFromRequest(r *http.Request) ([]byte, error) {
 
 	rst = append(rst, '\n')
 
-	p := make([]byte, BATCH_SIZE)
+	p := make([]byte, 1024)
 	for {
 		n, err := r.Body.Read(p)
 		if err != nil && err != io.EOF {
 			return nil, err
 		}
+		rst = append(rst, p[:n]...)
 		if err == io.EOF {
 			break
 		}
-		rst = append(rst, p[:n]...)
 	}
 	return rst, nil
 }
@@ -111,12 +111,14 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	start := 0
 	for {
-		buffer := make([]byte, 24+BATCH_SIZE)
+		buffer := make([]byte, BATCH_SIZE)
 		bufferLength, fragmentSize := fakeDNSRequestEncode(buffer, rawRequest, start)
 		log.Printf("fake dns request length: %d\n", bufferLength)
 		conn.Write(buffer[:bufferLength])
 		if start+fragmentSize >= len(rawRequest) {
 			break
+		} else {
+			start += fragmentSize
 		}
 	}
 
@@ -176,30 +178,30 @@ func fakeDNSRequestEncode(buffer, content []byte, start int) (int, int) {
 	binary.BigEndian.PutUint16(buffer[offset:], 1)
 	offset += 2
 
+	contentSize := len(content)
+	// total size
+	binary.BigEndian.PutUint32(buffer[offset:], uint32(contentSize))
+	offset += 4
+
 	// fragment start position
 	binary.BigEndian.PutUint32(buffer[offset:], uint32(start))
 	offset += 4
 
 	// fragment length
-	contentSize := len(content)
 	fl := 0
-	if start+BATCH_SIZE >= contentSize {
+	if BATCH_SIZE-offset-4 >= contentSize-start {
 		fl = contentSize - start
 	} else {
-		fl = BATCH_SIZE
+		fl = BATCH_SIZE - offset - 4
 	}
 	binary.BigEndian.PutUint32(buffer[offset:], uint32(fl))
-	offset += 4
-
-	// totol size
-	binary.BigEndian.PutUint32(buffer[offset:], uint32(contentSize))
 	offset += 4
 
 	log.Println(offset)
 	log.Println(fl)
 	log.Println(len(content))
 
-	copy(buffer[offset:], content[:fl])
+	copy(buffer[offset:], content[start:start+fl])
 	offset += fl
 	log.Println(offset)
 
