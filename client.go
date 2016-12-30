@@ -57,7 +57,6 @@ func init() {
 		panic(err)
 	}
 	log.Println("resolved dns server address")
-
 }
 
 func getStreamFromRequest(r *http.Request) ([]byte, error) {
@@ -83,6 +82,37 @@ func getStreamFromRequest(r *http.Request) ([]byte, error) {
 		}
 	}
 	return rst, nil
+}
+
+func getResponse(conn *net.UDPConn) ([]byte, error) {
+	lengthBuffer := make([]byte, 4)
+	conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(options.timeout)))
+	n, err := conn.Read(lengthBuffer)
+	if err != nil {
+		return nil, err
+	}
+
+	if n != 4 {
+		return nil, fmt.Errorf("could not read full lengthResponse")
+	}
+
+	length := int(binary.BigEndian.Uint32(lengthBuffer))
+	log.Printf("there will be %d bytes response from dns server\n", length)
+
+	response := make([]byte, length)
+	responseSize := 0
+	for {
+		conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(options.timeout)))
+		n, err := conn.Read(response[responseSize:])
+		if err != nil {
+			return nil, err
+		}
+		log.Printf("read %d bytes from dns server\n", n)
+		responseSize += n
+		if responseSize == length {
+			return response, nil
+		}
+	}
 }
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
@@ -121,27 +151,15 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	response := make([]byte, BATCH_SIZE)
-	responseSize := 0
-	buffer := make([]byte, 1024)
-	for {
-		conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(options.timeout)))
-		n, err := conn.Read(buffer)
-		if err != nil && err != io.EOF {
-			log.Printf("read dns response error: %s\n", err)
-			w.Write([]byte("read dns response error"))
-			w.Write([]byte(err.Error()))
-			w.WriteHeader(500)
-			return
-		}
-		log.Printf("read %d bytes\n", n)
-		response = append(response, buffer[:n]...)
-		responseSize += n
-		if err == io.EOF {
-			break
-		}
+	response, err := getResponse(conn)
+	if err != nil {
+		log.Printf("read fake dns response error: %s\n", err)
+		w.Write([]byte("read fake dns response error.\n"))
+		w.Write([]byte(err.Error()))
+		w.WriteHeader(500)
+		return
 	}
-	w.Write(response[:responseSize])
+	w.Write(response)
 	w.WriteHeader(200)
 	return
 }
