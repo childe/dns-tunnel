@@ -6,8 +6,11 @@ import (
 	"io"
 	"log"
 	"net"
+	"regexp"
 	"time"
 )
+
+var hostRegexp = regexp.MustCompile(":\\d+$")
 
 var BATCH_SIZE = 500
 
@@ -94,6 +97,9 @@ func abstractRealContentFromRawRequest(rawRequest []byte) (int, int, int, []byte
 }
 
 func launchHTTPRequest(host string, buffer []byte) ([]byte, error) {
+	if !hostRegexp.Match([]byte(host)) {
+		host += ":80"
+	}
 	tcpAddr, err := net.ResolveTCPAddr("tcp", host)
 	if err != nil {
 		log.Printf("failed to get tcp address from %s: %s", host, err)
