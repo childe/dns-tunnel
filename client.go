@@ -14,13 +14,12 @@ import (
 	"time"
 )
 
-var BATCH_SIZE = 500
+var BATCH_SIZE = 500 // dns request maybe unsuccessful if larger than this
 
 var OUTOFMAXSIZE = errors.New("OUTOFMAXSIZE")
 
 var options = &struct {
-	host      string
-	port      int
+	listen    string
 	dnsServer string
 	domain    string
 	timeout   uint64
@@ -29,9 +28,8 @@ var options = &struct {
 var dnsServerAddr *net.UDPAddr
 
 func init() {
-	flag.StringVar(&options.host, "host", "127.0.0.1", "ip/host that bind to, default 127.0.0.1")
-	flag.IntVar(&options.port, "port", 8080, "port that bind to, default 8080")
-	flag.StringVar(&options.dnsServer, "dns", "", "dns server")
+	flag.StringVar(&options.listen, "listen", "127.0.0.1:8080", "default 127.0.0.1:8080")
+	flag.StringVar(&options.dnsServer, "dns", "", "dns server, like 192.168.0.1:53")
 	flag.StringVar(&options.domain, "domain", "", "domain required, like yourdomain.me")
 	flag.Uint64Var(&options.timeout, "timeout", 10000, "timeout(ms) read from dns server")
 	flag.Parse()
@@ -235,8 +233,149 @@ func fakeDNSRequestEncode(buffer, content []byte, start int) (int, int) {
 	return offset, fl
 }
 
+//func readClientReqeust(conn *net.TCPConn) ([]byte, error) {
+////request := make([]byte, BATCH_SIZE)
+//buffer := make([]byte, BATCH_SIZE)
+//for {
+//n, err := conn.Read(buffer)
+//if err != nil {
+//return nil, err
+//}
+//log.Println(buffer[:n])
+//log.Println(string(buffer))
+//fakeDNSRequest, err := buildFakeDNSRequest(buffer)
+//if err != nil {
+//return nil, nil
+//}
+////request = append(request, buffer[:n]...)
+//}
+//return nil, nil
+//}
+
+func buildFakeDNSRequest(request []byte) ([]byte, error) {
+	//bufferLength, fragmentSize := fakeDNSRequestEncode(buffer, rawRequest, start)
+	return nil, nil
+}
+
+func getHostFromFirstRequestBuffer(buffer []byte) []byte {
+	secondLinePos := 0
+	for i := 0; i < len(buffer); i++ {
+		if buffer[i] == '\n' {
+			secondLinePos = i + 1
+			break
+		}
+	}
+
+	if secondLinePos == 0 {
+		return nil
+	}
+
+	hostStartPos := 0
+	for i := secondLinePos; i < len(buffer); i++ {
+		if buffer[i] == ' ' {
+			hostStartPos = i + 1
+		}
+	}
+
+	for i := hostStartPos; i < len(buffer); i++ {
+		if buffer[i] == '\n' {
+			return buffer[hostStartPos:i]
+		}
+	}
+
+	return nil
+}
+
+func removeHostFromUrl(buffer []byte, host []byte) []byte {
+	urlStartPos := 0
+	for i := 0; i < len(buffer); i++ {
+		if buffer[i] == ' ' {
+			urlStartPos = i + 1
+			break
+		}
+	}
+
+	hostStartPos := 0
+	for i := urlStartPos; i < len(buffer); i++ {
+		if buffer[i] == ':' {
+			hostStartPos = i + 3
+		}
+	}
+
+	return append(buffer[:urlStartPos], buffer[hostStartPos+len(host):]...)
+}
+
+/***
+1. read original request(stream) from client and save as []byte
+2. build fake dns request
+3. send fake dns request to dns server
+4. receive dns resonse which is actually http response
+5. write http response to client
+***/
+func processWholeProxyLife(conn *net.TCPConn) error {
+	defer conn.Close()
+
+	dnsconn, err := net.DialUDP("udp", nil, dnsServerAddr)
+	if err != nil {
+		return fmt.Errorf("could not dial to dns server[%s]: %s", dnsServerAddr, err)
+	}
+	log.Printf("connected to %s\n", dnsServerAddr)
+	defer dnsconn.Close()
+
+	var host []byte
+	host = nil
+	buffer := make([]byte, BATCH_SIZE)
+	for {
+		n, err := conn.Read(buffer)
+		if err != nil {
+			return fmt.Errorf("could not read request from client: %s", err)
+		}
+		log.Printf("read %s bytes from client: %s\n", n, string(buffer[:n]))
+
+		if host == nil {
+			host := getHostFromFirstRequestBuffer(buffer)
+			if host == nil {
+				return fmt.Errorf("could not get host from first request buffer(length %d)\n", n)
+			}
+			buffer := removeHostFromUrl(buffer[:n], host)
+			n = len(buffer)
+		}
+
+		fakeDNSRequest, err := buildFakeDNSRequest(buffer[:n])
+		if err != nil {
+			return fmt.Errorf("could not build fake dns request: %s", err)
+		}
+		log.Printf("fake dns request built: %v\n", fakeDNSRequest)
+
+		n, err = dnsconn.Write(fakeDNSRequest)
+		if err != nil {
+			return fmt.Errorf("could not send fake dns request: %s\n", err)
+		}
+		log.Printf("write %s bytes dns request to dns server\n", n)
+
+	}
+
+	return nil
+}
+
 func main() {
-	http.HandleFunc("/", proxyHandler)
-	log.Printf("%s:%d", options.host, options.port)
-	http.ListenAndServe(fmt.Sprintf("%s:%d", options.host, options.port), nil)
+	tcpAddr, err := net.ResolveTCPAddr("tcp", options.listen)
+	if err != nil {
+		log.Fatalf("could not resolve tcp adress[%s]: %s\n", options.listen, err)
+	}
+	tcpListener, err := net.ListenTCP("tcp", tcpAddr)
+	if err != nil {
+		log.Fatalf("could not listen on tcp adress[%s]: %s\n", options.listen, err)
+	}
+
+	log.Printf("listen on tcp adress[%s]\n", options.listen)
+
+	for {
+		conn, err := tcpListener.AcceptTCP()
+		if err != nil {
+			log.Printf("accept error: %s\n", err)
+		}
+		log.Printf("accept new conn[%s]", conn.RemoteAddr())
+		go processWholeProxyLife(conn)
+	}
 }
