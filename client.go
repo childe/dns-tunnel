@@ -322,8 +322,8 @@ func processWholeProxyLife(conn *net.TCPConn) error {
 	log.Printf("connected to %s\n", dnsServerAddr)
 	defer dnsconn.Close()
 
-	var host []byte
-	host = nil
+	//var host []byte
+	//host = nil
 	buffer := make([]byte, BATCH_SIZE)
 	for {
 		n, err := conn.Read(buffer)
@@ -332,14 +332,14 @@ func processWholeProxyLife(conn *net.TCPConn) error {
 		}
 		log.Printf("read %s bytes from client: %s\n", n, string(buffer[:n]))
 
-		if host == nil {
-			host := getHostFromFirstRequestBuffer(buffer)
-			if host == nil {
-				return fmt.Errorf("could not get host from first request buffer(length %d)\n", n)
-			}
-			buffer := removeHostFromUrl(buffer[:n], host)
-			n = len(buffer)
-		}
+		//if host == nil {
+		//host := getHostFromFirstRequestBuffer(buffer)
+		//if host == nil {
+		//return fmt.Errorf("could not get host from first request buffer(length %d)\n", n)
+		//}
+		//buffer := removeHostFromUrl(buffer[:n], host)
+		//n = len(buffer)
+		//}
 
 		fakeDNSRequest, err := buildFakeDNSRequest(buffer[:n])
 		if err != nil {
