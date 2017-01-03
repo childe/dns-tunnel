@@ -100,9 +100,10 @@ func launchHTTPRequest(host string, buffer []byte) ([]byte, error) {
 	if !hostRegexp.Match([]byte(host)) {
 		host += ":80"
 	}
+	log.Printf("host with port: %s\n", host)
 	tcpAddr, err := net.ResolveTCPAddr("tcp", host)
 	if err != nil {
-		log.Printf("failed to get tcp address from %s: %s", host, err)
+		log.Printf("failed to resolve tcp address from %s: %s\n", host, err)
 		return nil, err
 	} else {
 		log.Printf("tcp address to %s resolved\n", host)
