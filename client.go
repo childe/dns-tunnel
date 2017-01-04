@@ -84,9 +84,45 @@ func getStreamFromRequest(r *http.Request) ([]byte, error) {
 	return rst, nil
 }
 
+func getHeadersAndContentFromRawResponse(response []byte) (map[string]string, []byte) {
+	lineStart := 0
+	for i := 0; i < len(response); i++ {
+		if response[i] == '\r' && response[i+1] == '\n' {
+			lineStart = i + 2
+			break
+		}
+	}
+
+	headers := make(map[string]string)
+	var key string
+	var valueStart int
+	for {
+		if response[lineStart] == '\r' && response[lineStart+1] == '\n' {
+			return headers, response[lineStart+2:]
+		}
+
+		for i := lineStart; i < len(response); i++ {
+			if response[i] == ':' && response[i+1] == ' ' {
+				key = string(response[lineStart:i])
+				valueStart = i + 2
+				break
+			}
+		}
+
+		for i := valueStart; i < len(response); i++ {
+			if response[i] == '\r' && response[i+1] == '\n' {
+				headers[key] = string(response[valueStart:i])
+				lineStart = i + 2
+				break
+			}
+		}
+	}
+	return nil, nil
+}
+
 func getResponse(conn *net.UDPConn) ([]byte, error) {
 	lengthBuffer := make([]byte, 4)
-	conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(options.timeout)))
+	//conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(options.timeout)))
 	n, err := conn.Read(lengthBuffer)
 	if err != nil {
 		return nil, err
@@ -97,20 +133,28 @@ func getResponse(conn *net.UDPConn) ([]byte, error) {
 	}
 
 	length := int(binary.BigEndian.Uint32(lengthBuffer))
-	log.Printf("there will be %d bytes response from dns server\n", length)
+	log.Printf("the full response is %d bytes\n", length)
 
 	response := make([]byte, length)
 	responseSize := 0
+	buffer := make([]byte, 65535)
 	for {
-		conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(options.timeout)))
-		n, err := conn.Read(response[responseSize:])
+		//conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(options.timeout)))
+		n, err := conn.Read(buffer)
 		if err != nil {
 			return nil, err
 		}
-		log.Printf("read %d bytes from dns server\n", n)
-		responseSize += n
+		log.Printf("read %d bytes from proxy server\n", n)
+		offset := int(binary.BigEndian.Uint32(buffer[:4]))
+		log.Printf("offset %d\n", offset)
+		copy(response[offset:], buffer[4:n])
+		responseSize += n - 4
+		log.Printf("now response is %d bytes long\n", responseSize)
 		if responseSize == length {
 			return response, nil
+		}
+		if responseSize > length {
+			return nil, errors.New("response received from proxy server is larger than it should be")
 		}
 	}
 }
@@ -159,7 +203,16 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)
 		return
 	}
-	w.Write(response)
+
+	for key, _ := range w.Header() {
+		w.Header().Del(key)
+	}
+	headers, content := getHeadersAndContentFromRawResponse(response)
+	log.Printf("content length: %d\n", len(content))
+	for key, v := range headers {
+		w.Header().Set(key, v)
+	}
+	w.Write(content)
 	w.WriteHeader(200)
 	return
 }
@@ -224,13 +277,8 @@ func fakeDNSRequestEncode(buffer, content []byte, start int) (int, int) {
 	binary.BigEndian.PutUint32(buffer[offset:], uint32(fl))
 	offset += 4
 
-	log.Println(offset)
-	log.Println(fl)
-	log.Println(len(content))
-
 	copy(buffer[offset:], content[start:start+fl])
 	offset += fl
-	log.Println(offset)
 
 	return offset, fl
 }
