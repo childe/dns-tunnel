@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -84,9 +85,24 @@ func getStreamFromRequest(r *http.Request) ([]byte, error) {
 	return rst, nil
 }
 
-func getHeadersAndContentFromRawResponse(response []byte) (map[string]string, []byte) {
+func getHeadersCodeContentFromRawResponse(response []byte) (int, map[string]string, []byte) {
 	lineStart := 0
+	codestart := 0
+	var code int
+	var err error
 	for i := 0; i < len(response); i++ {
+		if response[i] == ' ' {
+			if codestart == 0 {
+				codestart = i + 1
+			} else if codestart != -1 {
+				code, err = strconv.Atoi((string(response[codestart:i])))
+				if err != nil {
+					log.Printf("could not convert \"%s\" to code: %s\n", string(response[codestart:i]), err)
+					return 0, nil, nil
+				}
+				codestart = -1
+			}
+		}
 		if response[i] == '\r' && response[i+1] == '\n' {
 			lineStart = i + 2
 			break
@@ -98,7 +114,7 @@ func getHeadersAndContentFromRawResponse(response []byte) (map[string]string, []
 	var valueStart int
 	for {
 		if response[lineStart] == '\r' && response[lineStart+1] == '\n' {
-			return headers, response[lineStart+2:]
+			return code, headers, response[lineStart+2:]
 		}
 
 		for i := lineStart; i < len(response); i++ {
@@ -117,7 +133,7 @@ func getHeadersAndContentFromRawResponse(response []byte) (map[string]string, []
 			}
 		}
 	}
-	return nil, nil
+	return code, nil, nil
 }
 
 func getResponse(conn *net.UDPConn) ([]byte, error) {
@@ -207,13 +223,15 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	for key, _ := range w.Header() {
 		w.Header().Del(key)
 	}
-	headers, content := getHeadersAndContentFromRawResponse(response)
+	code, headers, content := getHeadersCodeContentFromRawResponse(response)
+	log.Printf("code: %d\n", code)
 	log.Printf("content length: %d\n", len(content))
 	for key, v := range headers {
 		w.Header().Set(key, v)
 	}
+	w.Header().Set("ProxyAgent", "dnstunnel")
+	w.WriteHeader(code)
 	w.Write(content)
-	w.WriteHeader(200)
 	return
 }
 
