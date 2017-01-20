@@ -177,6 +177,7 @@ func getResponse(conn *net.UDPConn) ([]byte, error) {
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	rawRequest, err := getStreamFromRequest(r)
+	log.Println(rawRequest)
 	if err != nil {
 		log.Printf("failed to get raw string from request: %s\n", err)
 		w.Write([]byte("failed to get raw string from request.\n"))

@@ -118,6 +118,7 @@ func launchHTTPRequest(host string, buffer []byte) ([]byte, error) {
 		log.Printf("tcp connection to %s built\n", host)
 	}
 	defer tcpConn.Close()
+	log.Println(string(buffer))
 	_, err = tcpConn.Write(buffer)
 	if err != nil {
 		log.Printf("failed to write request to host %s: %s\n", host, err)
@@ -130,6 +131,7 @@ func launchHTTPRequest(host string, buffer []byte) ([]byte, error) {
 	for {
 		n, err := tcpConn.Read(bs)
 		log.Printf("read %d bytes from http server\n", n)
+		log.Println(string(bs[:n]))
 		if err != nil && err != io.EOF {
 			log.Printf("faild to read from http server: %s\n", err)
 			return nil, err
@@ -143,23 +145,31 @@ func launchHTTPRequest(host string, buffer []byte) ([]byte, error) {
 }
 
 func removeHostFromUrl(request []byte, host string) []byte {
-	urlstart := 0
-	for i := 0; i < len(request); i++ {
-		if request[i] == ' ' {
-			urlstart = i + 1
-			break
-		}
-	}
+	// RFC 2616: Must treat
+	//	GET /index.html HTTP/1.1
+	//	Host: www.google.com
+	// and
+	//	GET http://www.google.com/index.html HTTP/1.1
+	//	Host: doesntmatter
+	// the same. In the second case, any Host line is ignored.
+	return request
+	//urlstart := 0
+	//for i := 0; i < len(request); i++ {
+	//if request[i] == ' ' {
+	//urlstart = i + 1
+	//break
+	//}
+	//}
 
-	var pathstart int
-	for i := urlstart; i < len(request); i++ {
-		if request[i] == ':' {
-			pathstart += i + 3 + len(host)
-			break
-		}
-	}
+	//var pathstart int
+	//for i := urlstart; i < len(request); i++ {
+	//if request[i] == ':' {
+	//pathstart += i + 3 + len(host)
+	//break
+	//}
+	//}
 
-	return append(request[:urlstart], request[pathstart:]...)
+	//return append(request[:urlstart], request[pathstart:]...)
 }
 
 func processRealRequest(request []byte) ([]byte, error) {
