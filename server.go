@@ -72,7 +72,7 @@ func getHostFromRealRequest(request []byte) string {
 			if start == 0 {
 				start = i
 			} else {
-				return string(request[7+start : i])
+				return string(request[7+start : i-1])
 			}
 		}
 	}
@@ -100,8 +100,12 @@ func abstractRealContentFromRawRequest(rawRequest []byte) (int, int, int, []byte
 }
 
 func launchHTTPRequest(host string, buffer []byte) ([]byte, error) {
+	log.Printf("host withOrWithout port: %s\n", host)
 	if !hostRegexp.Match([]byte(host)) {
+		log.Println("host NOT contains port")
 		host += ":80"
+	} else {
+		log.Println("host contains port")
 	}
 	log.Printf("host with port: %s\n", host)
 	tcpAddr, err := net.ResolveTCPAddr("tcp", host)
@@ -175,7 +179,8 @@ func removeHostFromUrl(request []byte, host string) []byte {
 
 func processRealRequest(request []byte) ([]byte, error) {
 	host := getHostFromRealRequest(request)
-	log.Printf("host: %s\n", host)
+	log.Printf("host: %s[%d]\n", host, len(host))
+	log.Println([]byte(host))
 	response, err := launchHTTPRequest(host, removeHostFromUrl(request, host))
 	if err != nil {
 		log.Printf("failed to get http response: %s\n", err)
