@@ -5,9 +5,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -68,6 +71,183 @@ func getResponseFromDNSServer(conn *net.UDPConn) ([]byte, error) {
 }
 
 // Protocol: totalSize|startPositon|FragmentSize
+func getStreamFromRequest(r *http.Request) ([]byte, error) {
+	rst := make([]byte, 0)
+	//TODO
+	rst = append(rst, fmt.Sprintf("%s %s %s\n", r.Method, r.URL.String(), r.Proto)...)
+	rst = append(rst, fmt.Sprintf("Host: %s\n", r.Host)...)
+	for k, v := range r.Header {
+		rst = append(rst, fmt.Sprintf("%s: %s\n", k, strings.Join(v, ","))...)
+	}
+
+	rst = append(rst, '\n')
+
+	p := make([]byte, 1024)
+	for {
+		n, err := r.Body.Read(p)
+		if err != nil && err != io.EOF {
+			return nil, err
+		}
+		rst = append(rst, p[:n]...)
+		if err == io.EOF {
+			break
+		}
+	}
+	return rst, nil
+}
+
+func getHeadersCodeContentFromRawResponse(response []byte) (int, map[string]string, []byte) {
+	lineStart := 0
+	codestart := 0
+	var code int
+	var err error
+	for i := 0; i < len(response); i++ {
+		if response[i] == ' ' {
+			if codestart == 0 {
+				codestart = i + 1
+			} else if codestart != -1 {
+				code, err = strconv.Atoi((string(response[codestart:i])))
+				if err != nil {
+					log.Printf("could not convert \"%s\" to code: %s\n", string(response[codestart:i]), err)
+					return 0, nil, nil
+				}
+				codestart = -1
+			}
+		}
+		if response[i] == '\r' && response[i+1] == '\n' {
+			lineStart = i + 2
+			break
+		}
+	}
+
+	headers := make(map[string]string)
+	var key string
+	var valueStart int
+	for {
+		if response[lineStart] == '\r' && response[lineStart+1] == '\n' {
+			return code, headers, response[lineStart+2:]
+		}
+
+		for i := lineStart; i < len(response); i++ {
+			if response[i] == ':' && response[i+1] == ' ' {
+				key = string(response[lineStart:i])
+				valueStart = i + 2
+				break
+			}
+		}
+
+		for i := valueStart; i < len(response); i++ {
+			if response[i] == '\r' && response[i+1] == '\n' {
+				headers[key] = string(response[valueStart:i])
+				lineStart = i + 2
+				break
+			}
+		}
+	}
+	return code, nil, nil
+}
+
+func getResponse(conn *net.UDPConn) ([]byte, error) {
+	lengthBuffer := make([]byte, 4)
+	//conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(options.timeout)))
+	n, err := conn.Read(lengthBuffer)
+	if err != nil {
+		return nil, err
+	}
+
+	if n != 4 {
+		return nil, fmt.Errorf("could not read full lengthResponse")
+	}
+
+	length := int(binary.BigEndian.Uint32(lengthBuffer))
+	log.Printf("the full response is %d bytes\n", length)
+
+	response := make([]byte, length)
+	responseSize := 0
+	buffer := make([]byte, 65535)
+	for {
+		//conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(options.timeout)))
+		n, err := conn.Read(buffer)
+		if err != nil {
+			return nil, err
+		}
+		log.Printf("read %d bytes from proxy server\n", n)
+		offset := int(binary.BigEndian.Uint32(buffer[:4]))
+		log.Printf("offset %d\n", offset)
+		copy(response[offset:], buffer[4:n])
+		responseSize += n - 4
+		log.Printf("now response is %d bytes long\n", responseSize)
+		if responseSize == length {
+			return response, nil
+		}
+		if responseSize > length {
+			return nil, errors.New("response received from proxy server is larger than it should be")
+		}
+	}
+}
+
+func proxyHandler(w http.ResponseWriter, r *http.Request) {
+	rawRequest, err := getStreamFromRequest(r)
+	log.Println(rawRequest)
+	if err != nil {
+		log.Printf("failed to get raw string from request: %s\n", err)
+		w.Write([]byte("failed to get raw string from request.\n"))
+		w.Write([]byte(err.Error()))
+		w.WriteHeader(500)
+		return
+	}
+	log.Println(string(rawRequest))
+	log.Printf("rawRequest length: %d\n", len(rawRequest))
+
+	conn, err := net.DialUDP("udp", nil, dnsServerAddr)
+	if err != nil {
+		log.Printf("could not connect to dns server: %s\n", err)
+		w.Write([]byte("could not connect to dns server.\n"))
+		w.Write([]byte(err.Error()))
+		w.WriteHeader(500)
+		return
+	}
+	log.Printf("connected to %s\n", dnsServerAddr)
+	defer conn.Close()
+
+	start := 0
+	for {
+		buffer := make([]byte, BATCH_SIZE)
+		bufferLength, fragmentSize := fakeDNSRequestEncode(buffer, rawRequest, start)
+		log.Printf("fake dns request length: %d\n", bufferLength)
+		conn.Write(buffer[:bufferLength])
+		if start+fragmentSize >= len(rawRequest) {
+			break
+		} else {
+			start += fragmentSize
+		}
+	}
+
+	response, err := getResponse(conn)
+	if err != nil {
+		log.Printf("read fake dns response error: %s\n", err)
+		w.Write([]byte("read fake dns response error.\n"))
+		w.Write([]byte(err.Error()))
+		w.WriteHeader(500)
+		return
+	}
+
+	for key, _ := range w.Header() {
+		w.Header().Del(key)
+	}
+	code, headers, content := getHeadersCodeContentFromRawResponse(response)
+	log.Printf("code: %d\n", code)
+	log.Printf("content length: %d\n", len(content))
+	for key, v := range headers {
+		w.Header().Set(key, v)
+	}
+	w.Header().Set("ProxyAgent", "dnstunnel")
+	w.WriteHeader(code)
+	w.Write(content)
+	return
+}
+
+// the totalSize|startPositon|FragmentSize Protocol
 func fakeDNSRequestEncode(buffer, content []byte, start int) (int, int) {
 	log.Printf("buffer size: %d\n", len(buffer))
 	log.Printf("start postion: %d\n", start)
@@ -127,13 +307,8 @@ func fakeDNSRequestEncode(buffer, content []byte, start int) (int, int) {
 	binary.BigEndian.PutUint32(buffer[offset:], uint32(fl))
 	offset += 4
 
-	log.Println(offset)
-	log.Println(fl)
-	log.Println(len(content))
-
 	copy(buffer[offset:], content[start:start+fl])
 	offset += fl
-	log.Println(offset)
 
 	return offset, fl
 }

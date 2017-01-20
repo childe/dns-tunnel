@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/binary"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -30,12 +31,14 @@ var options = &struct {
 	bind          string
 	cleanInterval int
 	expire        int
+	udpBatchSize  int
 }{}
 
 func init() {
 	flag.StringVar(&options.bind, "bind", "0.0.0.0:53", "to which address faked dns server bind")
 	flag.IntVar(&options.cleanInterval, "clean-interval", 60, "")
 	flag.IntVar(&options.expire, "expire", 300, "expire time (s)")
+	flag.IntVar(&options.udpBatchSize, "udp-batch-size", 4096, "udp package could not be too long")
 	flag.Parse()
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 }
@@ -116,6 +119,7 @@ func launchHTTPRequest(host string, buffer []byte) ([]byte, error) {
 		log.Printf("tcp connection to %s built\n", host)
 	}
 	defer tcpConn.Close()
+	log.Println(string(buffer))
 	_, err = tcpConn.Write(buffer)
 	if err != nil {
 		log.Printf("failed to write request to host %s: %s\n", host, err)
@@ -128,6 +132,7 @@ func launchHTTPRequest(host string, buffer []byte) ([]byte, error) {
 	for {
 		n, err := tcpConn.Read(bs)
 		log.Printf("read %d bytes from http server\n", n)
+		log.Println(string(bs[:n]))
 		if err != nil && err != io.EOF {
 			log.Printf("faild to read from http server: %s\n", err)
 			return nil, err
@@ -141,23 +146,31 @@ func launchHTTPRequest(host string, buffer []byte) ([]byte, error) {
 }
 
 func removeHostFromUrl(request []byte, host string) []byte {
-	urlstart := 0
-	for i := 0; i < len(request); i++ {
-		if request[i] == ' ' {
-			urlstart = i + 1
-			break
-		}
-	}
+	// RFC 2616: Must treat
+	//	GET /index.html HTTP/1.1
+	//	Host: www.google.com
+	// and
+	//	GET http://www.google.com/index.html HTTP/1.1
+	//	Host: doesntmatter
+	// the same. In the second case, any Host line is ignored.
+	return request
+	//urlstart := 0
+	//for i := 0; i < len(request); i++ {
+	//if request[i] == ' ' {
+	//urlstart = i + 1
+	//break
+	//}
+	//}
 
-	var pathstart int
-	for i := urlstart; i < len(request); i++ {
-		if request[i] == ':' {
-			pathstart += i + 3 + len(host)
-			break
-		}
-	}
+	//var pathstart int
+	//for i := urlstart; i < len(request); i++ {
+	//if request[i] == ':' {
+	//pathstart += i + 3 + len(host)
+	//break
+	//}
+	//}
 
-	return append(request[:urlstart], request[pathstart:]...)
+	//return append(request[:urlstart], request[pathstart:]...)
 }
 
 func processRealRequest(request []byte) ([]byte, error) {
@@ -169,6 +182,41 @@ func processRealRequest(request []byte) ([]byte, error) {
 		return nil, err
 	}
 	return response, nil
+}
+
+func writebackResponse(buffer []byte, client net.Addr) error {
+	log.Println(string(buffer))
+	log.Printf("response length: %d\n", len(buffer))
+	start := 0
+	lengthBuffer := make([]byte, 4)
+	binary.BigEndian.PutUint32(lengthBuffer, uint32(len(buffer)))
+	n, err := conn.WriteTo(lengthBuffer, client)
+	if err != nil {
+		return fmt.Errorf("could not write lengthBuffer to proxy client: %s\n", err.Error())
+	}
+	if n != 4 {
+		return fmt.Errorf("did not fully write lengthBuffer to proxy client\n", err.Error())
+	}
+
+	for {
+		end := start + options.udpBatchSize
+		if end > len(buffer) {
+			end = len(buffer)
+		}
+		batch := make([]byte, 4+end-start)
+		binary.BigEndian.PutUint32(batch, uint32(start))
+		copy(batch[4:], buffer[start:end])
+		n, err := conn.WriteTo(batch, client)
+		if err != nil {
+			return fmt.Errorf("could not write batch to proxy client: %s\n", err.Error())
+		}
+		log.Printf("write back %d bytes response to proxy client\n", n)
+		if end == len(buffer) {
+			return nil
+		}
+		start += n - 4
+	}
+	return nil
 }
 
 func processFragments() {
@@ -195,16 +243,11 @@ func processFragments() {
 				response, err := processRealRequest(fragments.assembledRequest)
 				var writeErr error
 				var n int
-				lengthBuffer := make([]byte, 4)
 				if err != nil {
 					c := err.Error()
-					binary.BigEndian.PutUint32(lengthBuffer, uint32(len(c)))
-					conn.WriteTo(lengthBuffer, client)
-					n, writeErr = conn.WriteTo([]byte(c), client)
+					writeErr = writebackResponse([]byte(c), client)
 				} else {
-					binary.BigEndian.PutUint32(lengthBuffer, uint32(len(response)))
-					conn.WriteTo(lengthBuffer, client)
-					n, writeErr = conn.WriteTo(response, client)
+					writeErr = writebackResponse(response, client)
 				}
 				if writeErr != nil {
 					log.Printf("write response back error: %s\n", writeErr)
