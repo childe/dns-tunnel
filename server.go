@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -65,20 +68,6 @@ func cleanFragments() {
 	}
 }
 
-func getHostFromRealRequest(request []byte) string {
-	start := 0
-	for i := 0; i < len(request); i++ {
-		if request[i] == '\n' {
-			if start == 0 {
-				start = i
-			} else {
-				return string(request[7+start : i-1])
-			}
-		}
-	}
-	return ""
-}
-
 func abstractRealContentFromRawRequest(rawRequest []byte) (int, int, int, []byte) {
 	questionNumber := int(binary.BigEndian.Uint16(rawRequest[4:]))
 	offset := 12
@@ -99,54 +88,97 @@ func abstractRealContentFromRawRequest(rawRequest []byte) (int, int, int, []byte
 	return totalSize, startPositon, fragmentSize, rawRequest[offset+12:]
 }
 
-func launchHTTPRequest(host string, buffer []byte) ([]byte, error) {
-	log.Printf("host withOrWithout port: %s\n", host)
-	if !hostRegexp.Match([]byte(host)) {
-		log.Println("host NOT contains port")
-		host += ":80"
-	} else {
-		log.Println("host contains port")
+// read request and return headers and request body
+func readRequest(request []byte) (method, url string, headers map[string]string, body []byte) {
+	var offset int
+
+	headers = make(map[string]string)
+
+	urlstart := 0
+	for offset := 0; offset < len(request); offset++ {
+		if request[offset] == ' ' {
+			if urlstart == 0 {
+				method = string(request[:urlstart])
+				urlstart = 1 + offset
+			} else {
+				url = string(request[urlstart : offset-1])
+			}
+		}
 	}
-	log.Printf("host with port: %s\n", host)
-	tcpAddr, err := net.ResolveTCPAddr("tcp", host)
+
+	// read until first line break
+	for ; offset < len(request); offset++ {
+		if request[offset] == '\r' && request[offset+1] == '\n' {
+			offset += 2
+			break
+		}
+	}
+
+	var headStart, headEnd int
+	headStart = offset
+	for ; offset < len(request); offset++ {
+		if request[offset] == ':' && request[offset+1] == ' ' {
+			headEnd = offset
+			offset += 2
+			continue
+		}
+		if request[offset] == '\r' && request[offset+1] == '\n' {
+			log.Printf("offset: %d\theadStart: %d\theadEnd:%d\n", offset, headStart, headEnd)
+			headers[string(request[headStart:headEnd])] = string(request[headEnd+2 : offset])
+
+			if request[offset+2] == '\r' && request[offset+3] == '\n' {
+				body = request[offset+4:]
+				return
+			}
+
+			offset += 2
+			headStart = offset
+		}
+	}
+	return
+}
+
+func launchHTTPRequest(method, url string, headers map[string]string, body []byte) (*http.Response, error) {
+	request, err := http.NewRequest(method, url, bytes.NewReader(body))
 	if err != nil {
-		log.Printf("failed to resolve tcp address from %s: %s\n", host, err)
 		return nil, err
-	} else {
-		log.Printf("tcp address to %s resolved\n", host)
 	}
-	tcpConn, err := net.DialTCP("tcp", nil, tcpAddr)
-	if err != nil {
-		log.Printf("failed to get tcp connection: %s\n", host, err)
-		return nil, err
-	} else {
-		log.Printf("tcp connection to %s built\n", host)
+
+	log.Printf("original http request header: %v\n", request.Header)
+	for k, v := range headers {
+		request.Header[k] = []string{v}
 	}
-	defer tcpConn.Close()
-	log.Println(string(buffer))
-	_, err = tcpConn.Write(buffer)
-	if err != nil {
-		log.Printf("failed to write request to host %s: %s\n", host, err)
-		return nil, err
-	} else {
-		log.Println("write request to host")
+	log.Printf("http request header after reset: %v\n", request.Header)
+
+	client := &http.Client{}
+	return client.Do(request)
+}
+
+func readResponse(response *http.Response) (rst []byte) {
+	log.Printf("response header: %v\n", response.Header)
+	rst = append(rst, response.Proto...)
+	rst = append(rst, response.Status...)
+	rst = append(rst, '\r', '\n')
+	for k, v := range response.Header {
+		rst = append(rst, k...)
+		rst = append(rst, ':', ' ')
+		rst = append(rst, strings.Join(v, ",")...)
+		rst = append(rst, '\r', '\n')
 	}
-	response := []byte{}
-	bs := make([]byte, 4096)
+	rst = append(rst, '\r', '\n')
+	buffer := make([]byte, 65535)
 	for {
-		n, err := tcpConn.Read(bs)
-		log.Printf("read %d bytes from http server\n", n)
-		log.Println(string(bs[:n]))
-		if err != nil && err != io.EOF {
-			log.Printf("faild to read from http server: %s\n", err)
-			return nil, err
-		}
-		response = append(response, bs[:n]...)
+		n, err := response.Body.Read(buffer)
+		rst = append(rst, buffer[:n]...)
 		if err == io.EOF {
-			return response, nil
+			break
+		}
+		if err != nil {
+			log.Printf("read response body error: %s\n", err.Error())
+			return nil
 		}
 	}
-	return response, nil
+	return
 }
 
 func removeHostFromUrl(request []byte, host string) []byte {
@@ -177,16 +209,13 @@ func removeHostFromUrl(request []byte, host string) []byte {
 	//return append(request[:urlstart], request[pathstart:]...)
 }
 
-func processRealRequest(request []byte) ([]byte, error) {
-	host := getHostFromRealRequest(request)
-	log.Printf("host: %s[%d]\n", host, len(host))
-	log.Println([]byte(host))
-	response, err := launchHTTPRequest(host, removeHostFromUrl(request, host))
-	if err != nil {
-		log.Printf("failed to get http response: %s\n", err)
-		return nil, err
-	}
-	return response, nil
+func processRealRequest(request []byte) (*http.Response, error) {
+	method, url, headers, body := readRequest(request)
+	log.Printf("method: %s\n", method)
+	log.Printf("url: %s\n", url)
+	log.Printf("headers: %v\n", headers)
+	log.Printf("body: %s\n", body)
+	return launchHTTPRequest(method, url, headers, body)
 }
 
 func writebackResponse(buffer []byte, client net.Addr) error {
@@ -202,6 +231,8 @@ func writebackResponse(buffer []byte, client net.Addr) error {
 	if n != 4 {
 		return fmt.Errorf("did not fully write lengthBuffer to proxy client\n", err.Error())
 	}
+
+	log.Println("write content length to proxy client")
 
 	for {
 		end := start + options.udpBatchSize
@@ -247,17 +278,16 @@ func processFragments() {
 			if fragments.cureentSize == fragments.totalSize {
 				response, err := processRealRequest(fragments.assembledRequest)
 				var writeErr error
-				var n int
 				if err != nil {
 					c := err.Error()
 					writeErr = writebackResponse([]byte(c), client)
 				} else {
-					writeErr = writebackResponse(response, client)
+					writeErr = writebackResponse(readResponse(response), client)
 				}
 				if writeErr != nil {
 					log.Printf("write response back error: %s\n", writeErr)
 				} else {
-					log.Printf("write %d bytes response back\n", n)
+					log.Printf("write response back\n")
 				}
 				log.Printf("requests in client[%s] is being deleted\n", client)
 				delete(requestFragmentsMap, client)
