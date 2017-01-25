@@ -230,11 +230,16 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(err.Error()))
 		w.WriteHeader(500)
 		return
+	} else {
+		log.Println("got response from proxy server")
 	}
 
+	log.Printf("origin response headers: %v\n", w.Header())
 	for key, _ := range w.Header() {
 		w.Header().Del(key)
 	}
+	log.Printf("cleared response headers: %v\n", w.Header())
+
 	code, headers, content := getHeadersCodeContentFromRawResponse(response)
 	log.Printf("code: %d\n", code)
 	log.Printf("content length: %d\n", len(content))
@@ -242,6 +247,8 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(key, v)
 	}
 	w.Header().Set("ProxyAgent", "dnstunnel")
+	log.Printf("processed response headers: %v\n", w.Header())
+
 	w.WriteHeader(code)
 	w.Write(content)
 	return
@@ -456,23 +463,6 @@ func processWholeProxyLife(conn *net.TCPConn) error {
 }
 
 func main() {
-	tcpAddr, err := net.ResolveTCPAddr("tcp", options.listen)
-	if err != nil {
-		log.Fatalf("could not resolve tcp adress[%s]: %s\n", options.listen, err)
-	}
-	tcpListener, err := net.ListenTCP("tcp", tcpAddr)
-	if err != nil {
-		log.Fatalf("could not listen on tcp adress[%s]: %s\n", options.listen, err)
-	}
-
-	log.Printf("listen on tcp adress[%s]\n", options.listen)
-
-	for {
-		conn, err := tcpListener.AcceptTCP()
-		if err != nil {
-			log.Printf("accept error: %s\n", err)
-		}
-		log.Printf("accept new conn[%s]", conn.RemoteAddr())
-		go processWholeProxyLife(conn)
-	}
+	http.HandleFunc("/", proxyHandler)
+	http.ListenAndServe(options.listen, nil)
 }

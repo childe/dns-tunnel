@@ -90,18 +90,23 @@ func abstractRealContentFromRawRequest(rawRequest []byte) (int, int, int, []byte
 
 // read request and return headers and request body
 func readRequest(request []byte) (method, url string, headers map[string]string, body []byte) {
+	log.Println("readRequest func")
 	var offset int
 
 	headers = make(map[string]string)
 
 	urlstart := 0
 	for offset := 0; offset < len(request); offset++ {
+		//log.Printf("offset:%d %c\n", offset, request[offset])
 		if request[offset] == ' ' {
 			if urlstart == 0 {
-				method = string(request[:urlstart])
+				method = string(request[:offset])
+				log.Printf("method:%s\n", method)
 				urlstart = 1 + offset
 			} else {
-				url = string(request[urlstart : offset-1])
+				url = string(request[urlstart:offset])
+				log.Printf("url:%s\n", url)
+				break
 			}
 		}
 	}
@@ -128,6 +133,7 @@ func readRequest(request []byte) (method, url string, headers map[string]string,
 
 			if request[offset+2] == '\r' && request[offset+3] == '\n' {
 				body = request[offset+4:]
+				log.Println(headers)
 				return
 			}
 
@@ -135,6 +141,7 @@ func readRequest(request []byte) (method, url string, headers map[string]string,
 			headStart = offset
 		}
 	}
+	log.Println(headers)
 	return
 }
 
@@ -157,6 +164,7 @@ func launchHTTPRequest(method, url string, headers map[string]string, body []byt
 func readResponse(response *http.Response) (rst []byte) {
 	log.Printf("response header: %v\n", response.Header)
 	rst = append(rst, response.Proto...)
+	rst = append(rst, ' ')
 	rst = append(rst, response.Status...)
 	rst = append(rst, '\r', '\n')
 	for k, v := range response.Header {
@@ -261,13 +269,14 @@ func processFragments() {
 		for client, fragments := range requestFragmentsMap {
 			log.Printf("process client[%s]\n", client)
 			log.Printf("unprocessed requests length: %d\n", len(fragments.requests))
+			break
 			for _, request := range fragments.requests {
 				totalSize, startPositon, fragmentSize, realContent := abstractRealContentFromRawRequest(request)
 				if len(fragments.assembledRequest) == 0 {
 					fragments.assembledRequest = make([]byte, totalSize)
 				}
-				log.Printf("%d %d %d\n", totalSize, startPositon, fragmentSize)
-				log.Println(string(realContent))
+				log.Printf("totalSize:%d startPositon:%d fragmentSize:%d\n", totalSize, startPositon, fragmentSize)
+				log.Printf("realContent:%s\n", string(realContent))
 				copy(fragments.assembledRequest[startPositon:], realContent)
 				fragments.cureentSize += fragmentSize
 				// TODO
