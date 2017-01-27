@@ -24,9 +24,10 @@ type requestFragments struct {
 	requests         [][]byte
 	assembledRequest []byte
 	lastUpdate       time.Time
+	addr             net.Addr
 }
 
-var requestFragmentsMap map[net.Addr]*requestFragments
+var requestFragmentsMap map[string]*requestFragments
 
 var conn *net.UDPConn
 
@@ -269,7 +270,6 @@ func processFragments() {
 		for client, fragments := range requestFragmentsMap {
 			log.Printf("process client[%s]\n", client)
 			log.Printf("unprocessed requests length: %d\n", len(fragments.requests))
-			break
 			for _, request := range fragments.requests {
 				totalSize, startPositon, fragmentSize, realContent := abstractRealContentFromRawRequest(request)
 				if len(fragments.assembledRequest) == 0 {
@@ -289,9 +289,9 @@ func processFragments() {
 				var writeErr error
 				if err != nil {
 					c := err.Error()
-					writeErr = writebackResponse([]byte(c), client)
+					writeErr = writebackResponse([]byte(c), fragments.addr)
 				} else {
-					writeErr = writebackResponse(readResponse(response), client)
+					writeErr = writebackResponse(readResponse(response), fragments.addr)
 				}
 				if writeErr != nil {
 					log.Printf("write response back error: %s\n", writeErr)
@@ -307,7 +307,7 @@ func processFragments() {
 }
 
 func main() {
-	requestFragmentsMap = make(map[net.Addr]*requestFragments)
+	requestFragmentsMap = make(map[string]*requestFragments)
 	udpAddr, err := net.ResolveUDPAddr("udp4", options.bind)
 	if err != nil {
 		panic(err)
@@ -329,18 +329,19 @@ func main() {
 			log.Printf("read request error: %s\n", err)
 		}
 		log.Printf("read request. length: %d", n)
-		if value, ok := requestFragmentsMap[c]; ok {
-			log.Printf("client[%s] has been in map\n", c)
+		if value, ok := requestFragmentsMap[c.String()]; ok {
+			log.Printf("client[%s] has been in map\n", c.String())
 			value.lastUpdate = time.Now()
 			value.requests = append(value.requests, request[:n])
 		} else {
-			log.Printf("client[%s] has not been in map\n", c)
+			log.Printf("client[%s] has not been in map\n", c.String())
 			requests := [][]byte{request[:n]}
-			requestFragmentsMap[c] = &requestFragments{
+			requestFragmentsMap[c.String()] = &requestFragments{
 				lastUpdate:       time.Now(),
 				requests:         requests,
 				assembledRequest: make([]byte, 0),
 				cureentSize:      0,
+				addr:             c,
 			}
 		}
 		log.Printf("requestFragmentsMap length : %d\n", len(requestFragmentsMap))
