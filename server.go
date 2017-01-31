@@ -6,12 +6,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/golang/glog"
 )
 
 var hostRegexp = regexp.MustCompile(":\\d+$")
@@ -44,24 +45,19 @@ func init() {
 	flag.IntVar(&options.expire, "expire", 300, "expire time (s)")
 	flag.IntVar(&options.udpBatchSize, "udp-batch-size", 4096, "udp package could not be too long")
 	flag.Parse()
-	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
-}
-
-func getResponseForClient(c net.Addr, buffer []byte) {
-	n, err := conn.WriteTo(buffer, c)
-	if err != nil {
-		log.Println(err)
-	}
-	log.Println(n)
 }
 
 func cleanFragments() {
 	for {
-		log.Printf("clean expired fragments. requestFragmentsMap length : %d\n", len(requestFragmentsMap))
+		if glog.V(5) {
+			glog.Infof("clean expired fragments. requestFragmentsMap length : %d", len(requestFragmentsMap))
+		}
 		for client, fragments := range requestFragmentsMap {
-			log.Printf("client[%s] last update at %s\n", client, fragments.lastUpdate)
+			if glog.V(5) {
+				glog.Infof("client[%s] last update at %s", client, fragments.lastUpdate)
+			}
 			if fragments.lastUpdate.Add(time.Second * time.Duration(options.expire)).Before(time.Now()) {
-				log.Printf("delete client[%s] from map\n", client)
+				glog.Infof("delete client[%s] from map", client)
 				delete(requestFragmentsMap, client)
 			}
 		}
@@ -91,22 +87,20 @@ func abstractRealContentFromRawRequest(rawRequest []byte) (int, int, int, []byte
 
 // read request and return headers and request body
 func readRequest(request []byte) (method, url string, headers map[string]string, body []byte) {
-	log.Println("readRequest func")
 	var offset int
 
 	headers = make(map[string]string)
 
 	urlstart := 0
 	for offset := 0; offset < len(request); offset++ {
-		//log.Printf("offset:%d %c\n", offset, request[offset])
 		if request[offset] == ' ' {
 			if urlstart == 0 {
 				method = string(request[:offset])
-				log.Printf("method:%s\n", method)
+				glog.V(10).Infof("method:%s\n", method)
 				urlstart = 1 + offset
 			} else {
 				url = string(request[urlstart:offset])
-				log.Printf("url:%s\n", url)
+				glog.V(10).Infof("url:%s\n", url)
 				break
 			}
 		}
@@ -129,12 +123,11 @@ func readRequest(request []byte) (method, url string, headers map[string]string,
 			continue
 		}
 		if request[offset] == '\r' && request[offset+1] == '\n' {
-			log.Printf("offset: %d\theadStart: %d\theadEnd:%d\n", offset, headStart, headEnd)
 			headers[string(request[headStart:headEnd])] = string(request[headEnd+2 : offset])
 
 			if request[offset+2] == '\r' && request[offset+3] == '\n' {
 				body = request[offset+4:]
-				log.Println(headers)
+				glog.V(10).Infof("headers: %v", headers)
 				return
 			}
 
@@ -142,28 +135,11 @@ func readRequest(request []byte) (method, url string, headers map[string]string,
 			headStart = offset
 		}
 	}
-	log.Println(headers)
 	return
 }
 
-func launchHTTPRequest(method, url string, headers map[string]string, body []byte) (*http.Response, error) {
-	request, err := http.NewRequest(method, url, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-
-	log.Printf("original http request header: %v\n", request.Header)
-	for k, v := range headers {
-		request.Header[k] = []string{v}
-	}
-	log.Printf("http request header after reset: %v\n", request.Header)
-
-	client := &http.Client{}
-	return client.Do(request)
-}
-
 func readResponse(response *http.Response) (rst []byte) {
-	log.Printf("response header: %v\n", response.Header)
+	//TODO return error
 	rst = append(rst, response.Proto...)
 	rst = append(rst, ' ')
 	rst = append(rst, response.Status...)
@@ -183,7 +159,7 @@ func readResponse(response *http.Response) (rst []byte) {
 			break
 		}
 		if err != nil {
-			log.Printf("read response body error: %s\n", err.Error())
+			glog.Errorf("read response body error: %s", err.Error())
 			return nil
 		}
 	}
@@ -218,30 +194,43 @@ func removeHostFromUrl(request []byte, host string) []byte {
 	//return append(request[:urlstart], request[pathstart:]...)
 }
 
-func processRealRequest(request []byte) (*http.Response, error) {
-	method, url, headers, body := readRequest(request)
-	log.Printf("method: %s\n", method)
-	log.Printf("url: %s\n", url)
-	log.Printf("headers: %v\n", headers)
-	log.Printf("body: %s\n", body)
-	return launchHTTPRequest(method, url, headers, body)
+func processRealRequest(rawrequest []byte) (*http.Response, error) {
+	method, url, headers, body := readRequest(rawrequest)
+	glog.V(2).Infof("launchHTTPRequest %s %s", method, url)
+	if glog.V(5) {
+		glog.Infof("headers: %v", headers)
+		glog.Infof("body: %s", string(body))
+	}
+	request, err := http.NewRequest(method, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+
+	for k, v := range headers {
+		request.Header[k] = []string{v}
+	}
+
+	client := &http.Client{}
+	return client.Do(request)
 }
 
 func writebackResponse(buffer []byte, client net.Addr) error {
-	log.Println(string(buffer))
-	log.Printf("response length: %d\n", len(buffer))
+	if glog.V(10) {
+		glog.Infoln(string(buffer))
+		glog.Infof("response length: %d\n", len(buffer))
+	}
 	start := 0
 	lengthBuffer := make([]byte, 4)
 	binary.BigEndian.PutUint32(lengthBuffer, uint32(len(buffer)))
 	n, err := conn.WriteTo(lengthBuffer, client)
 	if err != nil {
-		return fmt.Errorf("could not write lengthBuffer to proxy client: %s\n", err.Error())
+		return fmt.Errorf("could not write lengthBuffer to proxy client: %s", err.Error())
 	}
 	if n != 4 {
-		return fmt.Errorf("did not fully write lengthBuffer to proxy client\n", err.Error())
+		return fmt.Errorf("did not fully write lengthBuffer to proxy client", err.Error())
 	}
 
-	log.Println("write content length to proxy client")
+	glog.V(9).Infoln("write content length to proxy client")
 
 	for {
 		end := start + options.udpBatchSize
@@ -253,9 +242,11 @@ func writebackResponse(buffer []byte, client net.Addr) error {
 		copy(batch[4:], buffer[start:end])
 		n, err := conn.WriteTo(batch, client)
 		if err != nil {
-			return fmt.Errorf("could not write batch to proxy client: %s\n", err.Error())
+			return fmt.Errorf("could not write batch to proxy client: %s", err.Error())
 		}
-		log.Printf("write back %d bytes response to proxy client\n", n)
+		if glog.V(9) {
+			glog.Infof("write back %d bytes response to proxy client", n)
+		}
 		if end == len(buffer) {
 			return nil
 		}
@@ -266,25 +257,30 @@ func writebackResponse(buffer []byte, client net.Addr) error {
 
 func processFragments() {
 	for {
-		//log.Printf("process fragments. requestFragmentsMap length : %d\n", len(requestFragmentsMap))
 		for client, fragments := range requestFragmentsMap {
-			log.Printf("process client[%s]\n", client)
-			log.Printf("unprocessed requests length: %d\n", len(fragments.requests))
+			if glog.V(9) {
+				glog.Infof("process client[%s]\n. unprocessed requests length: %d", client, len(fragments.requests))
+			}
 			for _, request := range fragments.requests {
 				totalSize, startPositon, fragmentSize, realContent := abstractRealContentFromRawRequest(request)
 				if len(fragments.assembledRequest) == 0 {
 					fragments.assembledRequest = make([]byte, totalSize)
 				}
-				log.Printf("totalSize:%d startPositon:%d fragmentSize:%d\n", totalSize, startPositon, fragmentSize)
-				log.Printf("realContent:%s\n", string(realContent))
+				if glog.V(9) {
+					glog.Infof("totalSize:%d startPositon:%d fragmentSize:%d", totalSize, startPositon, fragmentSize)
+					glog.Infof("realContent:%s", string(realContent))
+				}
 				copy(fragments.assembledRequest[startPositon:], realContent)
 				fragments.cureentSize += fragmentSize
 				// TODO
 				fragments.totalSize = totalSize
 			}
-			log.Printf("total size: %d. cureent size:%d\n", fragments.totalSize, fragments.cureentSize)
+			if glog.V(9) {
+				glog.Infof("total size: %d. cureent size:%d", fragments.totalSize, fragments.cureentSize)
+			}
 			fragments.requests = [][]byte{}
 			if fragments.cureentSize == fragments.totalSize {
+				glog.V(5).Infof("got fully message from %s", client)
 				response, err := processRealRequest(fragments.assembledRequest)
 				var writeErr error
 				if err != nil {
@@ -294,11 +290,11 @@ func processFragments() {
 					writeErr = writebackResponse(readResponse(response), fragments.addr)
 				}
 				if writeErr != nil {
-					log.Printf("write response back error: %s\n", writeErr)
+					glog.Errorf("write response back to %s error: %s", client, writeErr)
 				} else {
-					log.Printf("write response back\n")
+					glog.V(5).Infof("write response back to %s", client)
 				}
-				log.Printf("requests in client[%s] is being deleted\n", client)
+				glog.V(5).Infof("requests in client[%s] is being deleted", client)
 				delete(requestFragmentsMap, client)
 			}
 		}
@@ -326,15 +322,21 @@ func main() {
 		request := make([]byte, BATCH_SIZE)
 		n, c, err := conn.ReadFrom(request)
 		if err != nil {
-			log.Printf("read request error: %s\n", err)
+			glog.Errorf("read request error: %s", err)
 		}
-		log.Printf("read request. length: %d", n)
+		if glog.V(9) {
+			glog.Infof("read request. length: %d", n)
+		}
 		if value, ok := requestFragmentsMap[c.String()]; ok {
-			log.Printf("client[%s] has been in map\n", c.String())
+			if glog.V(5) {
+				glog.Infof("client[%s] has been in map\n", c.String())
+			}
 			value.lastUpdate = time.Now()
 			value.requests = append(value.requests, request[:n])
 		} else {
-			log.Printf("client[%s] has not been in map\n", c.String())
+			if glog.V(5) {
+				glog.Infof("client[%s] has not been in map\n", c.String())
+			}
 			requests := [][]byte{request[:n]}
 			requestFragmentsMap[c.String()] = &requestFragments{
 				lastUpdate:       time.Now(),
@@ -344,6 +346,5 @@ func main() {
 				addr:             c,
 			}
 		}
-		log.Printf("requestFragmentsMap length : %d\n", len(requestFragmentsMap))
 	}
 }

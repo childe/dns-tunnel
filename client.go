@@ -6,13 +6,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/golang/glog"
 )
 
 var BATCH_SIZE = 500 // dns request maybe unsuccessful if larger than this
@@ -48,26 +49,12 @@ func init() {
 		os.Exit(2)
 	}
 
-	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
-
 	var err error
 	dnsServerAddr, err = net.ResolveUDPAddr("udp", options.dnsServer)
 	if err != nil {
 		panic(err)
 	}
-	log.Println("resolved dns server address")
-}
-
-func getResponseFromDNSServer(conn *net.UDPConn) ([]byte, error) {
-	response := make([]byte, 65535)
-	for {
-		conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(options.timeout)))
-		n, err := conn.Read(response)
-		if err != nil {
-			return nil, err
-		}
-		log.Printf("read %d bytes from dns server\n", n)
-	}
+	glog.Infoln("resolved dns server address")
 }
 
 // Protocol: totalSize|startPositon|FragmentSize
@@ -108,7 +95,7 @@ func getHeadersCodeContentFromRawResponse(response []byte) (int, map[string]stri
 			} else if codestart != -1 {
 				code, err = strconv.Atoi((string(response[codestart:i])))
 				if err != nil {
-					log.Printf("could not convert \"%s\" to code: %s\n", string(response[codestart:i]), err)
+					glog.Errorf("could not convert \"%s\" to code: %s", string(response[codestart:i]), err)
 					return 0, nil, nil
 				}
 				codestart = -1
@@ -160,7 +147,9 @@ func getResponse(conn *net.UDPConn) ([]byte, error) {
 	}
 
 	length := int(binary.BigEndian.Uint32(lengthBuffer))
-	log.Printf("the full response is %d bytes\n", length)
+	if glog.V(5) {
+		glog.Infof("the full response is %d bytes", length)
+	}
 
 	response := make([]byte, length)
 	responseSize := 0
@@ -171,12 +160,21 @@ func getResponse(conn *net.UDPConn) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		log.Printf("read %d bytes from proxy server\n", n)
+		if glog.V(9) {
+			glog.Infof("read %d bytes from proxy server", n)
+		}
+
 		offset := int(binary.BigEndian.Uint32(buffer[:4]))
-		log.Printf("offset %d\n", offset)
+		if glog.V(9) {
+			glog.Infof("offset %d", offset)
+		}
+
 		copy(response[offset:], buffer[4:n])
 		responseSize += n - 4
-		log.Printf("now response is %d bytes long\n", responseSize)
+		if glog.V(9) {
+			glog.Infof("now response is %d bytes long", responseSize)
+		}
+
 		if responseSize == length {
 			return response, nil
 		}
@@ -187,34 +185,41 @@ func getResponse(conn *net.UDPConn) ([]byte, error) {
 }
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
+	glog.Infof("%s %s", r.Method, r.URL)
 	rawRequest, err := getStreamFromRequest(r)
-	log.Println(rawRequest)
+	if glog.V(10) {
+		glog.Infoln(rawRequest)
+		glog.Infof("rawRequest length: %d", len(rawRequest))
+	}
+
 	if err != nil {
-		log.Printf("failed to get raw string from request: %s\n", err)
+		glog.Errorf("failed to get raw string from request: %s", err)
 		w.Write([]byte("failed to get raw string from request.\n"))
 		w.Write([]byte(err.Error()))
 		w.WriteHeader(500)
 		return
 	}
-	log.Println(string(rawRequest))
-	log.Printf("rawRequest length: %d\n", len(rawRequest))
 
 	conn, err := net.DialUDP("udp", nil, dnsServerAddr)
+	defer conn.Close()
+	glog.Infof("%s %s %s", conn.LocalAddr(), r.Method, r.URL)
+
 	if err != nil {
-		log.Printf("could not connect to dns server: %s\n", err)
+		glog.Infof("could not connect to dns server: %s\n", err)
 		w.Write([]byte("could not connect to dns server.\n"))
 		w.Write([]byte(err.Error()))
 		w.WriteHeader(500)
 		return
 	}
-	log.Printf("connected to %s\n", dnsServerAddr)
-	defer conn.Close()
+	if glog.V(5) {
+		glog.Infof("connected to %s", dnsServerAddr)
+	}
 
 	start := 0
 	for {
 		buffer := make([]byte, BATCH_SIZE)
 		bufferLength, fragmentSize := fakeDNSRequestEncode(buffer, rawRequest, start)
-		log.Printf("fake dns request length: %d\n", bufferLength)
+		glog.V(9).Infof("fake dns request length: %d", bufferLength)
 		conn.Write(buffer[:bufferLength])
 		if start+fragmentSize >= len(rawRequest) {
 			break
@@ -225,29 +230,29 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	response, err := getResponse(conn)
 	if err != nil {
-		log.Printf("read fake dns response error: %s\n", err)
+		glog.Errorf("read fake dns response error: %s", err)
 		w.Write([]byte("read fake dns response error.\n"))
 		w.Write([]byte(err.Error()))
 		w.WriteHeader(500)
 		return
 	} else {
-		log.Println("got response from proxy server")
+		glog.V(9).Infof("got response[%d bytes] from proxy server", len(response))
 	}
 
-	log.Printf("origin response headers: %v\n", w.Header())
 	for key, _ := range w.Header() {
 		w.Header().Del(key)
 	}
-	log.Printf("cleared response headers: %v\n", w.Header())
 
 	code, headers, content := getHeadersCodeContentFromRawResponse(response)
-	log.Printf("code: %d\n", code)
-	log.Printf("content length: %d\n", len(content))
+	glog.Infof("response from proxy server: %s code: %d. content length: %d", conn.LocalAddr(), code, len(content))
+
 	for key, v := range headers {
 		w.Header().Set(key, v)
 	}
 	w.Header().Set("ProxyAgent", "dnstunnel")
-	log.Printf("processed response headers: %v\n", w.Header())
+	if glog.V(9) {
+		glog.Infof("processed response headers: %v\n", w.Header())
+	}
 
 	w.WriteHeader(code)
 	w.Write(content)
@@ -256,11 +261,13 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 // the totalSize|startPositon|FragmentSize Protocol
 func fakeDNSRequestEncode(buffer, content []byte, start int) (int, int) {
-	log.Printf("buffer size: %d\n", len(buffer))
-	log.Printf("start postion: %d\n", start)
+	if glog.V(9) {
+		glog.Infof("fakeDNSRequestEncode buffer size: %d", len(buffer))
+		glog.Infof("fakeDNSRequestEncode start postion: %d", start)
+	}
+
 	now := time.Now().UnixNano()
 	domain := fmt.Sprintf("%d.%s", now, options.domain)
-	log.Printf("domain: %s\n", domain)
 
 	binary.BigEndian.PutUint16(buffer, uint16(now))
 	var b uint16
@@ -320,14 +327,6 @@ func fakeDNSRequestEncode(buffer, content []byte, start int) (int, int) {
 	return offset, fl
 }
 
-func buildFakeDNSRequest(request []byte, startOffset int) ([]byte, error) {
-	buffer := make([]byte, 65535)
-	bufferLength, fragmentSize := fakeDNSRequestEncode(buffer, request, startOffset)
-	log.Printf("bufferLength: %d, fragmentSize: %d\n", bufferLength, fragmentSize)
-
-	return buffer[:bufferLength], nil
-}
-
 func getHostFromFirstRequestBuffer(buffer []byte) []byte {
 	secondLinePos := 0
 	for i := 0; i < len(buffer); i++ {
@@ -374,92 +373,6 @@ func removeHostFromUrl(buffer []byte, host []byte) []byte {
 	}
 
 	return append(buffer[:urlStartPos], buffer[hostStartPos+len(host):]...)
-}
-
-func receiveDNSResponseAndWriteback(closed *bool, conn *net.TCPConn, dnsconn *net.UDPConn) {
-	buffer := make([]byte, 65535)
-	for {
-		// TODO read timeout
-		n, err := dnsconn.Read(buffer)
-		if err != nil {
-			log.Printf("read dns response error: %s\n", err.Error())
-			*closed = true
-			return
-		}
-		if n < 4 {
-			log.Println("read dns response error: length smaller than 4")
-			*closed = true
-			return
-		}
-		if binary.BigEndian.Uint32(buffer) == 0 {
-			// http server closed connection
-			*closed = true
-			return
-		}
-		n, err = conn.Write(buffer[4:n])
-		if err != nil {
-			log.Printf("write back response to client error: %s\n", err.Error())
-			*closed = true
-			return
-		}
-	}
-}
-
-/***
-1. read original request(stream) from client and save as []byte
-2. build fake dns request
-3. send fake dns request to dns server
-4. receive dns resonse which is actually http response
-5. write http response to client
-***/
-func processWholeProxyLife(conn *net.TCPConn) error {
-	defer conn.Close()
-
-	dnsconn, err := net.DialUDP("udp", nil, dnsServerAddr)
-	if err != nil {
-		return fmt.Errorf("could not dial to dns server[%s]: %s", dnsServerAddr, err)
-	}
-	log.Printf("connected to %s\n", dnsServerAddr)
-	closed := false
-	go receiveDNSResponseAndWriteback(&closed, conn, dnsconn)
-	defer dnsconn.Close()
-
-	//var host []byte
-	//host = nil
-	buffer := make([]byte, BATCH_SIZE)
-	startOffset := 0
-	for closed != true {
-		n, err := conn.Read(buffer)
-		if err != nil {
-			return fmt.Errorf("could not read request from client: %s", err)
-		}
-		log.Printf("read %s bytes from client: %s\n", n, string(buffer[:n]))
-
-		//if host == nil {
-		//host := getHostFromFirstRequestBuffer(buffer)
-		//if host == nil {
-		//return fmt.Errorf("could not get host from first request buffer(length %d)\n", n)
-		//}
-		//buffer := removeHostFromUrl(buffer[:n], host)
-		//n = len(buffer)
-		//}
-
-		fakeDNSRequest, err := buildFakeDNSRequest(buffer[:n], startOffset)
-		if err != nil {
-			return fmt.Errorf("could not build fake dns request: %s", err)
-		}
-		log.Printf("fake dns request built: %v\n", fakeDNSRequest)
-
-		n, err = dnsconn.Write(fakeDNSRequest)
-		if err != nil {
-			return fmt.Errorf("could not send fake dns request: %s\n", err)
-		}
-		log.Printf("write %d bytes dns request to dns server\n", n)
-
-		startOffset += n
-	}
-
-	return nil
 }
 
 func main() {
