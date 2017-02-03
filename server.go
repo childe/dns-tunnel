@@ -1,15 +1,11 @@
 package main
 
 import (
-	"bytes"
 	"encoding/binary"
 	"flag"
-	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"regexp"
-	"strings"
 	"time"
 
 	"github.com/golang/glog"
@@ -64,7 +60,7 @@ func cleanFragments() {
 	}
 }
 
-func abstractRealContentFromRawRequest(rawRequest []byte) (int, int, int, []byte) {
+func abstractRealContentFromRawRequest(rawRequest []byte) (uint32, []byte) {
 	questionNumber := int(binary.BigEndian.Uint16(rawRequest[4:]))
 	offset := 12
 	for i := 0; i < questionNumber; i++ {
@@ -78,152 +74,8 @@ func abstractRealContentFromRawRequest(rawRequest []byte) (int, int, int, []byte
 		}
 	}
 	offset += 4
-	totalSize := int(binary.BigEndian.Uint32(rawRequest[offset:]))
-	startPositon := int(binary.BigEndian.Uint32(rawRequest[offset+4:]))
-	fragmentSize := int(binary.BigEndian.Uint32(rawRequest[offset+8:]))
-	return totalSize, startPositon, fragmentSize, rawRequest[offset+12:]
-}
-
-// read request and return headers and request body
-func readRequest(request []byte) (method, url string, headers map[string]string, body []byte) {
-	var offset int
-
-	headers = make(map[string]string)
-
-	urlstart := 0
-	for offset := 0; offset < len(request); offset++ {
-		if request[offset] == ' ' {
-			if urlstart == 0 {
-				method = string(request[:offset])
-				glog.V(10).Infof("method:%s\n", method)
-				urlstart = 1 + offset
-			} else {
-				url = string(request[urlstart:offset])
-				glog.V(10).Infof("url:%s\n", url)
-				break
-			}
-		}
-	}
-
-	// read until first line break
-	for ; offset < len(request); offset++ {
-		if request[offset] == '\r' && request[offset+1] == '\n' {
-			offset += 2
-			break
-		}
-	}
-
-	var headStart, headEnd int
-	headStart = offset
-	for ; offset < len(request); offset++ {
-		if request[offset] == ':' && request[offset+1] == ' ' {
-			headEnd = offset
-			offset += 2
-			continue
-		}
-		if request[offset] == '\r' && request[offset+1] == '\n' {
-			headers[string(request[headStart:headEnd])] = string(request[headEnd+2 : offset])
-
-			if request[offset+2] == '\r' && request[offset+3] == '\n' {
-				body = request[offset+4:]
-				glog.V(10).Infof("headers: %v", headers)
-				return
-			}
-
-			offset += 2
-			headStart = offset
-		}
-	}
-	return
-}
-
-func readResponse(response *http.Response) (rst []byte) {
-	//TODO return error
-	rst = append(rst, response.Proto...)
-	rst = append(rst, ' ')
-	rst = append(rst, response.Status...)
-	rst = append(rst, '\r', '\n')
-	for k, v := range response.Header {
-		rst = append(rst, k...)
-		rst = append(rst, ':', ' ')
-		rst = append(rst, strings.Join(v, ",")...)
-		rst = append(rst, '\r', '\n')
-	}
-	rst = append(rst, '\r', '\n')
-	buffer := make([]byte, 65535)
-	for {
-		n, err := response.Body.Read(buffer)
-		rst = append(rst, buffer[:n]...)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			glog.Errorf("read response body error: %s", err.Error())
-			return nil
-		}
-	}
-	return
-}
-
-func processRealRequest(rawrequest []byte) (*http.Response, error) {
-	method, url, headers, body := readRequest(rawrequest)
-	glog.V(2).Infof("launchHTTPRequest %s %s", method, url)
-	if glog.V(5) {
-		glog.Infof("headers: %v", headers)
-		glog.Infof("body: %s", body)
-	}
-	request, err := http.NewRequest(method, url, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-
-	for k, v := range headers {
-		request.Header[k] = []string{v}
-	}
-
-	client := &http.Client{}
-	return client.Do(request)
-}
-
-func writebackResponse(buffer []byte, client net.Addr) error {
-	if glog.V(10) {
-		glog.Infoln(string(buffer))
-		glog.Infof("response length: %d", len(buffer))
-	}
-	start := 0
-	lengthBuffer := make([]byte, 4)
-	binary.BigEndian.PutUint32(lengthBuffer, uint32(len(buffer)))
-	n, err := DNSconn.WriteTo(lengthBuffer, client)
-	if err != nil {
-		return fmt.Errorf("could not write lengthBuffer to proxy client: %s", err.Error())
-	}
-	if n != 4 {
-		return fmt.Errorf("did not fully write lengthBuffer to proxy client", err.Error())
-	}
-
-	glog.V(9).Infoln("write content length to proxy client")
-
-	for {
-		end := start + options.udpBatchSize
-		if end > len(buffer) {
-			end = len(buffer)
-		}
-		batch := make([]byte, 4+end-start)
-		binary.BigEndian.PutUint32(batch, uint32(start))
-		copy(batch[4:], buffer[start:end])
-		n, err := DNSconn.WriteTo(batch, client)
-		if err != nil {
-			return fmt.Errorf("could not write batch to proxy client: %s", err.Error())
-		}
-		if glog.V(9) {
-			glog.Infof("write back %d bytes response to proxy client", n)
-		}
-		if end == len(buffer) {
-			return nil
-		}
-		start += n - 4
-	}
-	return nil
+	start := binary.BigEndian.Uint32(rawRequest[offset:])
+	return start, rawRequest[offset+4:]
 }
 
 func connectHost(host []byte) *net.TCPConn {
@@ -286,15 +138,15 @@ func processClientRequest(client string) {
 
 	for idx, originalRequest := range clientBlock.originalRequests {
 		glog.V(9).Infof("client[%s] process the %d original request", client, idx)
-		offset := binary.BigEndian.Uint32(originalRequest[:4])
+		offset, content := abstractRealContentFromRawRequest(originalRequest)
 		glog.V(9).Infof("client[%s] offset %d", client, offset)
 		if offset == 0 {
-			hostLength := binary.BigEndian.Uint32(originalRequest[4:8])
-			clientBlock.host = originalRequest[8 : hostLength+8]
+			hostLength := binary.BigEndian.Uint32(content[:4])
+			clientBlock.host = content[4 : hostLength+4]
 
 			glog.V(9).Infof("got host[%s] in client %s", clientBlock.host, client)
 
-			clientBlock.requestSlices[offset] = originalRequest[8+hostLength:]
+			clientBlock.requestSlices[offset] = content[8+hostLength:]
 
 			conn := connectHost(clientBlock.host)
 			if conn != nil {
@@ -306,7 +158,7 @@ func processClientRequest(client string) {
 				return
 			}
 		} else {
-			clientBlock.requestSlices[offset] = originalRequest[4:]
+			clientBlock.requestSlices[offset] = content[4:]
 		}
 	}
 
