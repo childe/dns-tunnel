@@ -56,26 +56,69 @@ func init() {
 	}
 }
 
-func getResponse(dnsConn *net.UDPConn, conn net.Conn, closed *bool) {
-	timeout := time.Millisecond * time.Duration(options.readTimeout)
+func sendBuffer(conn *net.TCPConn, buffer []byte) error {
+	glog.V(10).Infof("content sent to %s:%s", conn.RemoteAddr(), buffer)
 	for {
+		n, err := conn.Write(buffer)
+		if err != nil {
+			return err
+		}
 
-		buffer := make([]byte, 65535)
-		for {
-			dnsConn.SetReadDeadline(time.Now().Add(timeout))
-			n, err := dnsConn.Read(buffer)
+		if n == len(buffer) {
+			return nil
+		}
+		buffer = buffer[n:]
+	}
+}
+
+func getResponse(dnsConn *net.UDPConn, conn *net.TCPConn, closed *bool) {
+	client := dnsConn.LocalAddr()
+	streamPool := map[uint32][]byte{}
+	nextStreamIdx := uint32(1)
+
+	timeout := time.Millisecond * time.Duration(options.readTimeout)
+
+	buffer := make([]byte, 65535)
+	for {
+		dnsConn.SetReadDeadline(time.Now().Add(timeout))
+		n, err := dnsConn.Read(buffer)
+		if err != nil {
+			glog.Errorf("client[%s] read from proxy server error: %s", client, err)
+			*closed = true
+			return
+		}
+		if glog.V(9) {
+			glog.Infof("client[%s] read %d bytes from proxy server", client, n)
+		}
+
+		streamIdx := binary.BigEndian.Uint32(buffer[:4])
+		if glog.V(9) {
+			glog.Infof("client[%s] streamIdx %d", client, streamIdx)
+		}
+
+		if streamIdx == 0 {
+			*closed = true
+			return
+		}
+
+		if streamIdx == nextStreamIdx {
+			err := sendBuffer(conn, buffer[4:])
 			if err != nil {
-				glog.Errorf("read from proxy server error: %s", err)
-				*closed = true
-				return
+				glog.Errorf("client[%s] write back to real client error:%s", client, err)
+			} else if glog.V(9) {
+				glog.Infof("client[%s] write %d response to real client", client, len(buffer[4:]))
 			}
-			if glog.V(9) {
-				glog.Infof("read %d bytes from proxy server", n)
-			}
+		} else {
+			streamPool[streamIdx] = buffer[4:]
+		}
 
-			offset := int(binary.BigEndian.Uint32(buffer[:4]))
-			if glog.V(9) {
-				glog.Infof("offset %d", offset)
+		for {
+			if buffer, ok := streamPool[nextStreamIdx]; ok {
+				sendBuffer(conn, buffer)
+				delete(streamPool, nextStreamIdx)
+				nextStreamIdx++
+			} else {
+				break
 			}
 		}
 	}
