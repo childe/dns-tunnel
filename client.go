@@ -71,17 +71,18 @@ func sendBuffer(conn *net.TCPConn, buffer []byte) error {
 	}
 }
 
-func getResponse(dnsConn *net.UDPConn, conn *net.TCPConn, closed *bool) {
+func passBetweenProxyServerAndRealClient(dnsConn *net.UDPConn, conn *net.TCPConn, closed *bool) {
 	client := dnsConn.LocalAddr()
 	streamPool := map[uint32][]byte{}
 	nextStreamIdx := uint32(1)
 
 	timeout := time.Millisecond * time.Duration(options.readTimeout)
 
-	buffer := make([]byte, 65535)
+	buffer1 := make([]byte, 65535)
 	for {
 		dnsConn.SetReadDeadline(time.Now().Add(timeout))
-		n, err := dnsConn.Read(buffer)
+		n, err := dnsConn.Read(buffer1)
+
 		if err != nil {
 			glog.Errorf("client[%s] read from proxy server error: %s", client, err)
 			*closed = true
@@ -91,7 +92,10 @@ func getResponse(dnsConn *net.UDPConn, conn *net.TCPConn, closed *bool) {
 			glog.Infof("client[%s] read %d bytes from proxy server", client, n)
 		}
 
-		streamIdx := binary.BigEndian.Uint32(buffer[:4])
+		buffer := make([]byte, n-4)
+		copy(buffer, buffer1[4:])
+
+		streamIdx := binary.BigEndian.Uint32(buffer1[:4])
 		if glog.V(9) {
 			glog.Infof("client[%s] streamIdx %d", client, streamIdx)
 		}
@@ -102,21 +106,27 @@ func getResponse(dnsConn *net.UDPConn, conn *net.TCPConn, closed *bool) {
 		}
 
 		if streamIdx == nextStreamIdx {
-			err := sendBuffer(conn, buffer[4:])
+			err := sendBuffer(conn, buffer)
 			if err != nil {
 				glog.Errorf("client[%s] write back to real client error:%s", client, err)
-			} else if glog.V(9) {
-				glog.Infof("client[%s] write %d response to real client", client, len(buffer[4:]))
+			} else {
+				nextStreamIdx++
+				glog.V(9).Infof("client[%s] write %d response to real client", client, len(buffer))
 			}
 		} else {
-			streamPool[streamIdx] = buffer[4:]
+			streamPool[streamIdx] = buffer
 		}
 
 		for {
 			if buffer, ok := streamPool[nextStreamIdx]; ok {
-				sendBuffer(conn, buffer)
-				delete(streamPool, nextStreamIdx)
-				nextStreamIdx++
+				err := sendBuffer(conn, buffer)
+				if err != nil {
+					glog.Errorf("client[%s] write back to real client error:%s", client, err)
+				} else {
+					glog.V(9).Infof("client[%s] write %d response to real client with %d streamIdx", client, len(buffer), streamIdx)
+					delete(streamPool, nextStreamIdx)
+					nextStreamIdx++
+				}
 			} else {
 				break
 			}
@@ -233,7 +243,7 @@ func p(conn *net.TCPConn) {
 	var closed bool
 	offset = 0
 	closed = false
-	go getResponse(dnsConn, conn, &closed)
+	go passBetweenProxyServerAndRealClient(dnsConn, conn, &closed)
 
 	buffer = make([]byte, options.dnsBatchSize)
 	previousBuffer = make([]byte, 0)
