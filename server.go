@@ -97,6 +97,7 @@ func connectHost(host []byte) *net.TCPConn {
 }
 
 func sendBuffer(conn *net.TCPConn, buffer []byte) error {
+	glog.V(10).Infof("content sent to %s:%s", conn.RemoteAddr(), buffer)
 	for {
 		n, err := conn.Write(buffer)
 		if err != nil {
@@ -115,13 +116,16 @@ func passBetweenRealServerAndProxyClient(conn *net.TCPConn, dnsRemoteAddr *net.U
 	for {
 		n, err := conn.Read(buffer[4:])
 		if err == io.EOF {
+			glog.V(5).Infof("connection[%s] closed from server", conn.RemoteAddr())
 			conn.Close()
 			DNSconn.Write([]byte{0, 0, 0, 0})
 			return
 		}
 		if err != nil {
 			glog.Errorf("read from real server error:%s", err)
+			return
 		}
+		glog.V(9).Infof("connection[%s] read %d bytes response", conn.RemoteAddr(), n)
 		binary.BigEndian.PutUint32(buffer, uint32(n))
 		DNSconn.Write(buffer[:4+n])
 	}
@@ -144,12 +148,13 @@ func processClientRequest(client string) {
 			hostLength := binary.BigEndian.Uint32(content[:4])
 			clientBlock.host = content[4 : hostLength+4]
 
-			glog.V(9).Infof("got host[%s] in client %s", clientBlock.host, client)
+			glog.V(5).Infof("client[%s] got host[%s]", client, clientBlock.host)
 
-			clientBlock.requestSlices[offset] = content[8+hostLength:]
+			clientBlock.requestSlices[offset] = content[4+hostLength:]
 
 			conn := connectHost(clientBlock.host)
 			if conn != nil {
+				glog.V(5).Infof("client[%s] connected to host[%s]", client, clientBlock.host)
 				clientBlock.conn = conn
 				go passBetweenRealServerAndProxyClient(conn, clientBlock.addr)
 			} else {
@@ -158,7 +163,7 @@ func processClientRequest(client string) {
 				return
 			}
 		} else {
-			clientBlock.requestSlices[offset] = content[4:]
+			clientBlock.requestSlices[offset] = content
 		}
 	}
 
@@ -180,6 +185,7 @@ func processClientRequest(client string) {
 					//TODO if conn has been closed ?
 					glog.Errorf("could not send request to real server[%s]: %s", clientBlock.conn.RemoteAddr(), err)
 				} else {
+					glog.V(9).Infof("client[%s] request slice sent to real server", client)
 					//TODO delete in a loop??
 					delete(clientBlock.requestSlices, offset)
 					clientBlock.nextOffset += uint32(len(content))
