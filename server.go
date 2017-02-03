@@ -113,6 +113,7 @@ func sendBuffer(conn *net.TCPConn, buffer []byte) error {
 
 func passBetweenRealServerAndProxyClient(conn *net.TCPConn, dnsRemoteAddr *net.UDPAddr) {
 	buffer := make([]byte, options.udpBatchSize)
+	streamIdx := 1
 	for {
 		n, err := conn.Read(buffer[4:])
 		if err == io.EOF {
@@ -126,8 +127,9 @@ func passBetweenRealServerAndProxyClient(conn *net.TCPConn, dnsRemoteAddr *net.U
 			return
 		}
 		glog.V(9).Infof("connection[%s] read %d bytes response", conn.RemoteAddr(), n)
-		binary.BigEndian.PutUint32(buffer, uint32(n))
+		binary.BigEndian.PutUint32(buffer, uint32(streamIdx))
 		DNSconn.Write(buffer[:4+n])
+		streamIdx++
 	}
 }
 
