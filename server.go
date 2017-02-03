@@ -117,7 +117,7 @@ func passBetweenRealServerAndProxyClient(conn *net.TCPConn, dnsRemoteAddr *net.U
 	for {
 		n, err := conn.Read(buffer[4:])
 		if err == io.EOF {
-			glog.V(5).Infof("connection[%s] closed from server", conn.RemoteAddr())
+			glog.V(5).Infof("client[%s] connection[%s] closed from server", dnsRemoteAddr, conn.RemoteAddr())
 			conn.Close()
 			DNSconn.Write([]byte{0, 0, 0, 0})
 			return
@@ -126,9 +126,12 @@ func passBetweenRealServerAndProxyClient(conn *net.TCPConn, dnsRemoteAddr *net.U
 			glog.Errorf("read from real server error:%s", err)
 			return
 		}
-		glog.V(9).Infof("connection[%s] read %d bytes response", conn.RemoteAddr(), n)
+		glog.V(9).Infof("client[%s] connection[%s] read %d bytes response", dnsRemoteAddr, conn.RemoteAddr(), n)
 		binary.BigEndian.PutUint32(buffer, uint32(streamIdx))
-		DNSconn.Write(buffer[:4+n])
+		n, err = DNSconn.WriteToUDP(buffer[:4+n], dnsRemoteAddr)
+		if err != nil {
+			glog.Errorf("client[%s] send to proxy client error:%s", dnsRemoteAddr, err)
+		}
 		streamIdx++
 	}
 }
