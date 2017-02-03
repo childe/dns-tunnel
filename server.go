@@ -17,20 +17,19 @@ import (
 
 var hostRegexp = regexp.MustCompile(":\\d+$")
 
-var BATCH_SIZE = 500
-
-type requestFragments struct {
-	cureentSize      int
-	totalSize        int
-	requests         [][]byte
-	assembledRequest []byte
+type clientBlock struct {
 	lastUpdate       time.Time
-	addr             net.Addr
+	addr             *net.UDPAddr
+	originalRequests [][]byte
+	requestSlices    map[uint32][]byte
+	nextOffset       uint32
+	host             []byte
+	conn             *net.TCPConn
 }
 
-var requestFragmentsMap map[string]*requestFragments
+var clientBlocksMap map[string]*clientBlock = make(map[string]*clientBlock)
 
-var conn *net.UDPConn
+var DNSconn *net.UDPConn
 
 var options = &struct {
 	bind          string
@@ -50,15 +49,15 @@ func init() {
 func cleanFragments() {
 	for {
 		if glog.V(5) {
-			glog.Infof("clean expired fragments. requestFragmentsMap length : %d", len(requestFragmentsMap))
+			glog.Infof("clean expired fragments. requestFragmentsMap length : %d", len(clientBlocksMap))
 		}
-		for client, fragments := range requestFragmentsMap {
+		for client, fragments := range clientBlocksMap {
 			if glog.V(5) {
 				glog.Infof("client[%s] last update at %s", client, fragments.lastUpdate)
 			}
 			if fragments.lastUpdate.Add(time.Second * time.Duration(options.expire)).Before(time.Now()) {
 				glog.Infof("delete client[%s] from map", client)
-				delete(requestFragmentsMap, client)
+				delete(clientBlocksMap, client)
 			}
 		}
 		time.Sleep(time.Duration(options.cleanInterval) * time.Second)
@@ -166,40 +165,12 @@ func readResponse(response *http.Response) (rst []byte) {
 	return
 }
 
-func removeHostFromUrl(request []byte, host string) []byte {
-	// RFC 2616: Must treat
-	//	GET /index.html HTTP/1.1
-	//	Host: www.google.com
-	// and
-	//	GET http://www.google.com/index.html HTTP/1.1
-	//	Host: doesntmatter
-	// the same. In the second case, any Host line is ignored.
-	return request
-	//urlstart := 0
-	//for i := 0; i < len(request); i++ {
-	//if request[i] == ' ' {
-	//urlstart = i + 1
-	//break
-	//}
-	//}
-
-	//var pathstart int
-	//for i := urlstart; i < len(request); i++ {
-	//if request[i] == ':' {
-	//pathstart += i + 3 + len(host)
-	//break
-	//}
-	//}
-
-	//return append(request[:urlstart], request[pathstart:]...)
-}
-
 func processRealRequest(rawrequest []byte) (*http.Response, error) {
 	method, url, headers, body := readRequest(rawrequest)
 	glog.V(2).Infof("launchHTTPRequest %s %s", method, url)
 	if glog.V(5) {
 		glog.Infof("headers: %v", headers)
-		glog.Infof("body: %s", string(body))
+		glog.Infof("body: %s", body)
 	}
 	request, err := http.NewRequest(method, url, bytes.NewReader(body))
 	if err != nil {
@@ -217,12 +188,12 @@ func processRealRequest(rawrequest []byte) (*http.Response, error) {
 func writebackResponse(buffer []byte, client net.Addr) error {
 	if glog.V(10) {
 		glog.Infoln(string(buffer))
-		glog.Infof("response length: %d\n", len(buffer))
+		glog.Infof("response length: %d", len(buffer))
 	}
 	start := 0
 	lengthBuffer := make([]byte, 4)
 	binary.BigEndian.PutUint32(lengthBuffer, uint32(len(buffer)))
-	n, err := conn.WriteTo(lengthBuffer, client)
+	n, err := DNSconn.WriteTo(lengthBuffer, client)
 	if err != nil {
 		return fmt.Errorf("could not write lengthBuffer to proxy client: %s", err.Error())
 	}
@@ -240,7 +211,7 @@ func writebackResponse(buffer []byte, client net.Addr) error {
 		batch := make([]byte, 4+end-start)
 		binary.BigEndian.PutUint32(batch, uint32(start))
 		copy(batch[4:], buffer[start:end])
-		n, err := conn.WriteTo(batch, client)
+		n, err := DNSconn.WriteTo(batch, client)
 		if err != nil {
 			return fmt.Errorf("could not write batch to proxy client: %s", err.Error())
 		}
@@ -255,96 +226,166 @@ func writebackResponse(buffer []byte, client net.Addr) error {
 	return nil
 }
 
-func processFragments() {
+func connectHost(host []byte) *net.TCPConn {
+	if !hostRegexp.Match(host) {
+		host = append(host, ":80"...)
+	}
+	serverAddr, err := net.ResolveTCPAddr("tcp", string(host))
+	if err != nil {
+		glog.Errorf("could not resove address[%s]", host)
+		return nil
+	}
+
+	tcpConn, err := net.DialTCP("tcp", nil, serverAddr)
+	if err != nil {
+		glog.Errorf("could not dial to address[%s]", host)
+		return nil
+	}
+	return tcpConn
+}
+
+func sendBuffer(conn *net.TCPConn, buffer []byte) error {
 	for {
-		for client, fragments := range requestFragmentsMap {
-			if glog.V(9) {
-				glog.Infof("process client[%s]\n. unprocessed requests length: %d", client, len(fragments.requests))
+		n, err := conn.Write(buffer)
+		if err != nil {
+			return err
+		}
+
+		if n == len(buffer) {
+			return nil
+		}
+		buffer = buffer[n:]
+	}
+}
+
+func passBetweenRealServerAndProxyClient(conn *net.TCPConn, dnsRemoteAddr *net.UDPAddr) {
+	buffer := make([]byte, options.udpBatchSize)
+	for {
+		n, err := conn.Read(buffer[4:])
+		if err == io.EOF {
+			conn.Close()
+			DNSconn.Write([]byte{0, 0, 0, 0})
+			return
+		}
+		if err != nil {
+			glog.Errorf("read from real server error:%s", err)
+		}
+		binary.BigEndian.PutUint32(buffer, uint32(n))
+		DNSconn.Write(buffer[:4+n])
+	}
+}
+
+/*
+parse host and build connection;
+loop requestSlices and send to real server
+*/
+func processClientRequest(client string) {
+	glog.V(9).Infof("process client %s", client)
+	clientBlock, _ := clientBlocksMap[client]
+	glog.V(9).Infof("client[%s] there is %d original requests", client, len(clientBlock.originalRequests))
+
+	for idx, originalRequest := range clientBlock.originalRequests {
+		glog.V(9).Infof("client[%s] process the %d original request", client, idx)
+		offset := binary.BigEndian.Uint32(originalRequest[:4])
+		glog.V(9).Infof("client[%s] offset %d", client, offset)
+		if offset == 0 {
+			hostLength := binary.BigEndian.Uint32(originalRequest[4:8])
+			clientBlock.host = originalRequest[8 : hostLength+8]
+
+			glog.V(9).Infof("got host[%s] in client %s", clientBlock.host, client)
+
+			clientBlock.requestSlices[offset] = originalRequest[8+hostLength:]
+
+			conn := connectHost(clientBlock.host)
+			if conn != nil {
+				clientBlock.conn = conn
+				go passBetweenRealServerAndProxyClient(conn, clientBlock.addr)
+			} else {
+				//TODO lock?
+				delete(clientBlocksMap, client)
+				return
 			}
-			for _, request := range fragments.requests {
-				totalSize, startPositon, fragmentSize, realContent := abstractRealContentFromRawRequest(request)
-				if len(fragments.assembledRequest) == 0 {
-					fragments.assembledRequest = make([]byte, totalSize)
-				}
-				if glog.V(9) {
-					glog.Infof("totalSize:%d startPositon:%d fragmentSize:%d", totalSize, startPositon, fragmentSize)
-					glog.Infof("realContent:%s", string(realContent))
-				}
-				copy(fragments.assembledRequest[startPositon:], realContent)
-				fragments.cureentSize += fragmentSize
-				// TODO
-				fragments.totalSize = totalSize
-			}
-			if glog.V(9) {
-				glog.Infof("total size: %d. cureent size:%d", fragments.totalSize, fragments.cureentSize)
-			}
-			fragments.requests = [][]byte{}
-			if fragments.cureentSize == fragments.totalSize {
-				glog.V(5).Infof("got fully message from %s", client)
-				response, err := processRealRequest(fragments.assembledRequest)
-				var writeErr error
+		} else {
+			clientBlock.requestSlices[offset] = originalRequest[4:]
+		}
+	}
+
+	//TODO lock?
+	clientBlock.originalRequests = make([][]byte, 0)
+
+	if clientBlock.conn == nil {
+		// Not get host yet
+		return
+	}
+
+	changed := true
+	for changed == true {
+		changed = false
+		for offset, content := range clientBlock.requestSlices {
+			if offset == clientBlock.nextOffset {
+				err := sendBuffer(clientBlock.conn, content)
 				if err != nil {
-					c := err.Error()
-					writeErr = writebackResponse([]byte(c), fragments.addr)
+					//TODO if conn has been closed ?
+					glog.Errorf("could not send request to real server[%s]: %s", clientBlock.conn.RemoteAddr(), err)
 				} else {
-					writeErr = writebackResponse(readResponse(response), fragments.addr)
+					//TODO delete in a loop??
+					delete(clientBlock.requestSlices, offset)
+					clientBlock.nextOffset += uint32(len(content))
+					changed = true
 				}
-				if writeErr != nil {
-					glog.Errorf("write response back to %s error: %s", client, writeErr)
-				} else {
-					glog.V(5).Infof("write response back to %s", client)
-				}
-				glog.V(5).Infof("requests in client[%s] is being deleted", client)
-				delete(requestFragmentsMap, client)
 			}
 		}
-		time.Sleep(time.Duration(1000) * time.Millisecond)
 	}
 }
 
 func main() {
-	requestFragmentsMap = make(map[string]*requestFragments)
-	udpAddr, err := net.ResolveUDPAddr("udp4", options.bind)
+	udpAddr, err := net.ResolveUDPAddr("udp", options.bind)
 	if err != nil {
 		panic(err)
 	}
 
-	conn, err = net.ListenUDP("udp4", udpAddr)
+	DNSconn, err = net.ListenUDP("udp", udpAddr)
 
 	if err != nil {
 		panic(err)
 	}
+	glog.Infof("listen on %s", options.bind)
 
 	go cleanFragments()
-	go processFragments()
 
 	for {
-		request := make([]byte, BATCH_SIZE)
-		n, c, err := conn.ReadFrom(request)
+		request := make([]byte, 65535)
+		n, c, err := DNSconn.ReadFromUDP(request)
 		if err != nil {
-			glog.Errorf("read request error: %s", err)
+			glog.Errorf("read request from %s error: %s", c, err)
+			continue
 		}
+
 		if glog.V(9) {
-			glog.Infof("read request. length: %d", n)
+			glog.Infof("read request from %s, length: %d", c, n)
 		}
-		if value, ok := requestFragmentsMap[c.String()]; ok {
+
+		if value, ok := clientBlocksMap[c.String()]; ok {
 			if glog.V(5) {
-				glog.Infof("client[%s] has been in map\n", c.String())
+				glog.Infof("client[%s] has been in map", c)
 			}
 			value.lastUpdate = time.Now()
-			value.requests = append(value.requests, request[:n])
+			value.originalRequests = append(value.originalRequests, request[:n])
 		} else {
 			if glog.V(5) {
-				glog.Infof("client[%s] has not been in map\n", c.String())
+				glog.Infof("client[%s] has not been in map", c)
 			}
-			requests := [][]byte{request[:n]}
-			requestFragmentsMap[c.String()] = &requestFragments{
+			originalRequests := [][]byte{request[:n]}
+			clientBlocksMap[c.String()] = &clientBlock{
 				lastUpdate:       time.Now(),
-				requests:         requests,
-				assembledRequest: make([]byte, 0),
-				cureentSize:      0,
+				originalRequests: originalRequests,
+				requestSlices:    map[uint32][]byte{},
+				nextOffset:       0,
 				addr:             c,
+				host:             nil,
+				conn:             nil,
 			}
 		}
+		go processClientRequest(c.String())
 	}
 }
