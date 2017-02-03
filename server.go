@@ -75,7 +75,7 @@ func abstractRealContentFromRawRequest(rawRequest []byte) (uint32, []byte) {
 	}
 	offset += 4
 	start := binary.BigEndian.Uint32(rawRequest[offset:])
-	return start, rawRequest[offset+4:]
+	return start, append([]byte{}, rawRequest[offset+4:]...)
 }
 
 func connectHost(host []byte) *net.TCPConn {
@@ -97,7 +97,7 @@ func connectHost(host []byte) *net.TCPConn {
 }
 
 func sendBuffer(conn *net.TCPConn, buffer []byte) error {
-	glog.V(10).Infof("content sent to %s:%s", conn.RemoteAddr(), buffer)
+	glog.V(9).Infof("content sent to %s:%s", conn.RemoteAddr(), buffer)
 	for {
 		n, err := conn.Write(buffer)
 		if err != nil {
@@ -128,9 +128,11 @@ func passBetweenRealServerAndProxyClient(conn *net.TCPConn, dnsRemoteAddr *net.U
 		}
 		glog.V(9).Infof("client[%s] connection[%s] read %d bytes response", dnsRemoteAddr, conn.RemoteAddr(), n)
 		binary.BigEndian.PutUint32(buffer, uint32(streamIdx))
-		n, err = DNSconn.WriteToUDP(buffer[:4+n], dnsRemoteAddr)
+		_, err = DNSconn.WriteToUDP(buffer[:4+n], dnsRemoteAddr)
 		if err != nil {
 			glog.Errorf("client[%s] send to proxy client error:%s", dnsRemoteAddr, err)
+		} else if glog.V(9) {
+			glog.Infof("client[%s] send to proxy client with slice index %d", dnsRemoteAddr, streamIdx)
 		}
 		streamIdx++
 	}
@@ -180,23 +182,20 @@ func processClientRequest(client string) {
 		return
 	}
 
-	changed := true
-	for changed == true {
-		changed = false
-		for offset, content := range clientBlock.requestSlices {
-			if offset == clientBlock.nextOffset {
-				err := sendBuffer(clientBlock.conn, content)
-				if err != nil {
-					//TODO if conn has been closed ?
-					glog.Errorf("could not send request to real server[%s]: %s", clientBlock.conn.RemoteAddr(), err)
-				} else {
-					glog.V(9).Infof("client[%s] request slice sent to real server", client)
-					//TODO delete in a loop??
-					delete(clientBlock.requestSlices, offset)
-					clientBlock.nextOffset += uint32(len(content))
-					changed = true
-				}
+	for {
+		if content, ok := clientBlock.requestSlices[clientBlock.nextOffset]; ok {
+			err := sendBuffer(clientBlock.conn, content)
+			if err != nil {
+				//TODO if conn has been closed ?
+				glog.Errorf("could not send request to real server[%s]: %s", clientBlock.conn.RemoteAddr(), err)
+			} else {
+				glog.V(9).Infof("client[%s] request slice sent to real server", client)
+				//TODO delete in a loop??
+				delete(clientBlock.requestSlices, clientBlock.nextOffset)
+				clientBlock.nextOffset += uint32(len(content))
 			}
+		} else {
+			return
 		}
 	}
 }
