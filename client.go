@@ -84,7 +84,7 @@ func getResponse(dnsConn *net.UDPConn, conn net.Conn, closed *bool) {
 // the startPositon|FragmentSize Protocol
 // host is nil if start is not 0
 func fakeDNSRequestEncode(buffer, host []byte, start int) []byte {
-	rst := make([]byte, 8+len(host)+len(buffer))
+	rst := make([]byte, 65535)
 	if glog.V(9) {
 		glog.Infof("fakeDNSRequestEncode buffer size: %d", len(buffer))
 		glog.Infof("fakeDNSRequestEncode start postion: %d", start)
@@ -140,7 +140,7 @@ func fakeDNSRequestEncode(buffer, host []byte, start int) []byte {
 
 	copy(rst[offset:], buffer)
 
-	return rst
+	return rst[:offset+len(buffer)]
 }
 
 /*
