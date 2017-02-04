@@ -25,7 +25,7 @@ type clientBlock struct {
 	host             []byte
 	conn             *net.TCPConn
 	mu               sync.Mutex
-	co               sync.Cond
+	co               *sync.Cond
 }
 
 var clientBlocksMap map[string]*clientBlock = make(map[string]*clientBlock)
@@ -159,7 +159,12 @@ func processClientRequest(client string) {
 			clientBlock.mu.Unlock()
 			//如果request slice在路上丢失, 可能会导致goroutine永远不醒来不return.
 			//所以在clear expire的时候, 需要Signal
+			glog.V(9).Infoln("no new original requests. wait for new ones.")
+			clientBlock.co.L.Lock()
 			clientBlock.co.Wait()
+			glog.V(9).Infoln("i am awake, get new original requests.")
+			clientBlock.co.L.Unlock()
+			continue
 		}
 		for idx, originalRequest := range clientBlock.originalRequests {
 			glog.V(9).Infof("client[%s] process the %d original request", client, idx)
@@ -189,9 +194,9 @@ func processClientRequest(client string) {
 				go passBetweenRealServerAndProxyClient(conn, clientBlock.addr)
 			} else {
 				glog.Errorf("client[%s] could not connect to host[%s]", client, clientBlock.host)
-				cblockmu.Lock()
-				delete(clientBlocksMap, client)
-				cblockmu.Unlock()
+				//cblockmu.Lock()
+				//delete(clientBlocksMap, client)
+				//cblockmu.Unlock()
 				return
 			}
 		}
@@ -200,16 +205,17 @@ func processClientRequest(client string) {
 			if content, ok := clientBlock.requestSlices[clientBlock.nextOffset]; ok {
 				err := sendBuffer(clientBlock.conn, content)
 				if err != nil {
-					//TODO if conn has been closed ?
+					//TODO if conn has been closed ? or need retry?
 					glog.Errorf("could not send request to real server[%s]: %s", clientBlock.conn.RemoteAddr(), err)
+					return
 				} else {
 					glog.V(9).Infof("client[%s] request slice sent to real server", client)
 					//TODO delete in a loop??
-					delete(clientBlock.requestSlices, clientBlock.nextOffset)
+					//delete(clientBlock.requestSlices, clientBlock.nextOffset)
 					clientBlock.nextOffset += uint32(len(content))
 				}
 			} else {
-				return
+				break
 			}
 		}
 	}
@@ -269,6 +275,7 @@ func main() {
 				addr:             c,
 				host:             nil,
 				conn:             nil,
+				co:               sync.NewCond(&sync.Mutex{}),
 			}
 			go processClientRequest(c.String())
 		}
