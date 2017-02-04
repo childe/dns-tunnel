@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"regexp"
+	"sync"
 	"time"
 
 	"github.com/golang/glog"
@@ -21,6 +22,7 @@ type clientBlock struct {
 	nextOffset       uint32
 	host             []byte
 	conn             *net.TCPConn
+	mu               sync.Mutex
 }
 
 var clientBlocksMap map[string]*clientBlock = make(map[string]*clientBlock)
@@ -117,7 +119,7 @@ func passBetweenRealServerAndProxyClient(conn *net.TCPConn, dnsRemoteAddr *net.U
 	for {
 		n, err := conn.Read(buffer[4:])
 		if err == io.EOF {
-			glog.V(5).Infof("client[%s] connection[%s] closed from server", dnsRemoteAddr, conn.RemoteAddr())
+			glog.V(2).Infof("client[%s] connection[%s] closed from server", dnsRemoteAddr, conn.RemoteAddr())
 			conn.Close()
 			DNSconn.Write([]byte{0, 0, 0, 0})
 			return
@@ -153,9 +155,9 @@ func processClientRequest(client string) {
 		glog.V(9).Infof("client[%s] offset %d", client, offset)
 		if offset == 0 {
 			hostLength := binary.BigEndian.Uint32(content[:4])
-			clientBlock.host = content[4 : hostLength+4]
+			clientBlock.host = append([]byte{}, content[4:hostLength+4]...)
 
-			glog.V(5).Infof("client[%s] got host[%s]", client, clientBlock.host)
+			glog.Infof("client[%s] got host[%s]", client, clientBlock.host)
 
 			clientBlock.requestSlices[offset] = content[4+hostLength:]
 
@@ -175,7 +177,9 @@ func processClientRequest(client string) {
 	}
 
 	//TODO lock?
+	clientBlock.mu.Lock()
 	clientBlock.originalRequests = make([][]byte, 0)
+	clientBlock.mu.Unlock()
 
 	if clientBlock.conn == nil {
 		// Not get host yet
@@ -215,29 +219,34 @@ func main() {
 
 	go cleanFragments()
 
+	buffer := make([]byte, 65535)
 	for {
-		request := make([]byte, 65535)
-		n, c, err := DNSconn.ReadFromUDP(request)
+		n, c, err := DNSconn.ReadFromUDP(buffer)
 		if err != nil {
-			glog.Errorf("read request from %s error: %s", c, err)
+			glog.Errorf("read from %s error: %s", c, err)
 			continue
 		}
 
 		if glog.V(9) {
-			glog.Infof("read request from %s, length: %d", c, n)
+			glog.Infof("read %d bytes from %s", n, c)
 		}
+
+		request := make([]byte, n)
+		copy(request, buffer[:n])
 
 		if value, ok := clientBlocksMap[c.String()]; ok {
 			if glog.V(5) {
 				glog.Infof("client[%s] has been in map", c)
 			}
 			value.lastUpdate = time.Now()
-			value.originalRequests = append(value.originalRequests, request[:n])
+			value.mu.Lock()
+			value.originalRequests = append(value.originalRequests, request)
+			value.mu.Unlock()
 		} else {
 			if glog.V(5) {
 				glog.Infof("client[%s] has not been in map", c)
 			}
-			originalRequests := [][]byte{request[:n]}
+			originalRequests := [][]byte{request}
 			clientBlocksMap[c.String()] = &clientBlock{
 				lastUpdate:       time.Now(),
 				originalRequests: originalRequests,
