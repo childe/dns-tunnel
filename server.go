@@ -13,6 +13,8 @@ import (
 )
 
 var hostRegexp = regexp.MustCompile(":\\d+$")
+var cblockmu sync.Mutex
+var DNSconn *net.UDPConn
 
 type clientBlock struct {
 	lastUpdate       time.Time
@@ -23,11 +25,10 @@ type clientBlock struct {
 	host             []byte
 	conn             *net.TCPConn
 	mu               sync.Mutex
+	co               sync.Cond
 }
 
 var clientBlocksMap map[string]*clientBlock = make(map[string]*clientBlock)
-
-var DNSconn *net.UDPConn
 
 var options = &struct {
 	bind          string
@@ -54,8 +55,11 @@ func cleanFragments() {
 				glog.Infof("client[%s] last update at %s", client, fragments.lastUpdate)
 			}
 			if fragments.lastUpdate.Add(time.Second * time.Duration(options.expire)).Before(time.Now()) {
+				fragments.co.Signal()
 				glog.Infof("delete client[%s] from map", client)
+				cblockmu.Lock()
 				delete(clientBlocksMap, client)
+				cblockmu.Unlock()
 			}
 		}
 		time.Sleep(time.Duration(options.cleanInterval) * time.Second)
@@ -149,57 +153,64 @@ func processClientRequest(client string) {
 	clientBlock, _ := clientBlocksMap[client]
 	glog.V(9).Infof("client[%s] there is %d original requests", client, len(clientBlock.originalRequests))
 
-	for idx, originalRequest := range clientBlock.originalRequests {
-		glog.V(9).Infof("client[%s] process the %d original request", client, idx)
-		offset, content := abstractRealContentFromRawRequest(originalRequest)
-		glog.V(9).Infof("client[%s] offset %d", client, offset)
-		if offset == 0 {
-			hostLength := binary.BigEndian.Uint32(content[:4])
-			clientBlock.host = append([]byte{}, content[4:hostLength+4]...)
+	for {
+		clientBlock.mu.Lock()
+		if len(clientBlock.originalRequests) == 0 {
+			clientBlock.mu.Unlock()
+			//如果request slice在路上丢失, 可能会导致goroutine永远不醒来不return.
+			//所以在clear expire的时候, 需要Signal
+			clientBlock.co.Wait()
+		}
+		for idx, originalRequest := range clientBlock.originalRequests {
+			glog.V(9).Infof("client[%s] process the %d original request", client, idx)
+			offset, content := abstractRealContentFromRawRequest(originalRequest)
+			glog.V(9).Infof("client[%s] offset %d", client, offset)
+			if offset == 0 {
+				hostLength := binary.BigEndian.Uint32(content[:4])
+				clientBlock.host = append([]byte{}, content[4:hostLength+4]...)
 
-			glog.Infof("client[%s] got host[%s]", client, clientBlock.host)
+				glog.Infof("client[%s] got host[%s]", client, clientBlock.host)
 
-			clientBlock.requestSlices[offset] = content[4+hostLength:]
+				clientBlock.requestSlices[offset] = content[4+hostLength:]
 
+			} else {
+				clientBlock.requestSlices[offset] = content
+			}
+		}
+
+		clientBlock.originalRequests = make([][]byte, 0)
+		clientBlock.mu.Unlock()
+
+		if clientBlock.conn == nil {
 			conn := connectHost(clientBlock.host)
 			if conn != nil {
 				glog.V(5).Infof("client[%s] connected to host[%s]", client, clientBlock.host)
 				clientBlock.conn = conn
 				go passBetweenRealServerAndProxyClient(conn, clientBlock.addr)
 			} else {
-				//TODO lock?
+				glog.Errorf("client[%s] could not connect to host[%s]", client, clientBlock.host)
+				cblockmu.Lock()
 				delete(clientBlocksMap, client)
+				cblockmu.Unlock()
 				return
 			}
-		} else {
-			clientBlock.requestSlices[offset] = content
 		}
-	}
 
-	//TODO lock?
-	clientBlock.mu.Lock()
-	clientBlock.originalRequests = make([][]byte, 0)
-	clientBlock.mu.Unlock()
-
-	if clientBlock.conn == nil {
-		// Not get host yet
-		return
-	}
-
-	for {
-		if content, ok := clientBlock.requestSlices[clientBlock.nextOffset]; ok {
-			err := sendBuffer(clientBlock.conn, content)
-			if err != nil {
-				//TODO if conn has been closed ?
-				glog.Errorf("could not send request to real server[%s]: %s", clientBlock.conn.RemoteAddr(), err)
+		for {
+			if content, ok := clientBlock.requestSlices[clientBlock.nextOffset]; ok {
+				err := sendBuffer(clientBlock.conn, content)
+				if err != nil {
+					//TODO if conn has been closed ?
+					glog.Errorf("could not send request to real server[%s]: %s", clientBlock.conn.RemoteAddr(), err)
+				} else {
+					glog.V(9).Infof("client[%s] request slice sent to real server", client)
+					//TODO delete in a loop??
+					delete(clientBlock.requestSlices, clientBlock.nextOffset)
+					clientBlock.nextOffset += uint32(len(content))
+				}
 			} else {
-				glog.V(9).Infof("client[%s] request slice sent to real server", client)
-				//TODO delete in a loop??
-				delete(clientBlock.requestSlices, clientBlock.nextOffset)
-				clientBlock.nextOffset += uint32(len(content))
+				return
 			}
-		} else {
-			return
 		}
 	}
 }
@@ -234,6 +245,8 @@ func main() {
 		request := make([]byte, n)
 		copy(request, buffer[:n])
 
+		cblockmu.Lock()
+		// 琐应该放在最外面. 避免更新value的同时, 它也被删除
 		if value, ok := clientBlocksMap[c.String()]; ok {
 			if glog.V(5) {
 				glog.Infof("client[%s] has been in map", c)
@@ -242,9 +255,10 @@ func main() {
 			value.mu.Lock()
 			value.originalRequests = append(value.originalRequests, request)
 			value.mu.Unlock()
+			value.co.Signal()
 		} else {
 			if glog.V(5) {
-				glog.Infof("client[%s] has not been in map", c)
+				glog.Infof("client[%s] is not in map", c)
 			}
 			originalRequests := [][]byte{request}
 			clientBlocksMap[c.String()] = &clientBlock{
@@ -256,7 +270,8 @@ func main() {
 				host:             nil,
 				conn:             nil,
 			}
+			go processClientRequest(c.String())
 		}
-		go processClientRequest(c.String())
+		cblockmu.Unlock()
 	}
 }
