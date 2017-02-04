@@ -239,6 +239,7 @@ func p(conn *net.TCPConn) {
 
 	var n, offset int
 	var host []byte
+	host = nil
 	var previousBuffer, buffer []byte
 	var closed bool
 	offset = 0
@@ -250,27 +251,28 @@ func p(conn *net.TCPConn) {
 	for closed == false {
 		n, err = conn.Read(buffer)
 		if err == io.EOF {
-			glog.Errorf("%s real client send EOF before response", conn.RemoteAddr())
+			glog.Errorf("%s real client send EOF before server closes", conn.RemoteAddr())
 			return
 		}
 
 		// get host from first line
-		if previousBuffer != nil {
-			buffer = append(previousBuffer, buffer[:n]...)
-		}
-		host, err = getHostFromFirstRequestBuffer(buffer)
-
-		if err != nil {
-			glog.Errorln(err.Error())
-			return
-		}
-
-		// url is longer than options.dnsBatchSize
 		if host == nil {
-			previousBuffer = append(previousBuffer, buffer[:n]...)
-			continue
+			buffer = append(previousBuffer, buffer[:n]...)
+			host, err = getHostFromFirstRequestBuffer(buffer)
+
+			if err != nil {
+				glog.Errorf("could not get host from %s: %s", buffer, err)
+				return
+			}
+
+			// url is longer than options.dnsBatchSize
+			if host == nil {
+				previousBuffer = append(previousBuffer, buffer[:n]...)
+				continue
+			}
+			previousBuffer = nil
+			glog.V(2).Infof("get host[%s] from request", host)
 		}
-		glog.V(2).Infof("get host[%s] from request", host)
 
 		dnsReqeust := fakeDNSRequestEncode(buffer, host, offset)
 		offset += len(buffer)
