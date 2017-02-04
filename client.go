@@ -251,7 +251,10 @@ func p(conn *net.TCPConn) {
 	for closed == false {
 		n, err = conn.Read(buffer)
 		if err == io.EOF {
-			glog.Errorf("%s real client send EOF before server closes", conn.RemoteAddr())
+			//TODO curl could send EOF before server when keep-alive. we need pass the message to proxy server
+			if glog.V(9) {
+				glog.Infof("%s real client send EOF before server closes", conn.RemoteAddr())
+			}
 			return
 		}
 
