@@ -76,11 +76,11 @@ func passBetweenProxyServerAndRealClient(dnsConn *net.UDPConn, conn *net.TCPConn
 	streamPool := map[uint32][]byte{}
 	nextStreamIdx := uint32(1)
 
-	timeout := time.Millisecond * time.Duration(options.readTimeout)
+	//timeout := time.Millisecond * time.Duration(options.readTimeout)
 
 	buffer1 := make([]byte, 65535)
 	for {
-		dnsConn.SetReadDeadline(time.Now().Add(timeout))
+		//dnsConn.SetReadDeadline(time.Now().Add(timeout))
 		n, err := dnsConn.Read(buffer1)
 
 		if err != nil {
@@ -226,7 +226,7 @@ get stream from real client, and parse HOST from the first line.
 then send the stream to proxy server slice by slice
 */
 func p(conn *net.TCPConn) {
-	defer glog.Infof("%s is closed", conn.RemoteAddr())
+	defer glog.Infof("connection to real client[%s] is closed after process goroutine returns", conn.RemoteAddr())
 	defer conn.Close()
 
 	var err error
